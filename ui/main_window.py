@@ -4,7 +4,7 @@ ui/main_window.py
 """
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QFileDialog, QMessageBox, QLabel, QSplitter,
+    QFileDialog, QMessageBox, QLabel,
     QScrollArea, QDialog, QTextBrowser, QPushButton, QVBoxLayout as QVBox
 )
 import os
@@ -117,25 +117,11 @@ class MainWindow(QMainWindow):
         self._toolbar = Toolbar()
         root.addWidget(self._toolbar)
 
-        # 중앙: 원본 + 편집 미리보기
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(4)
-
-        # 원본 패널
-        orig_panel = self._make_preview_panel("원본")
-        self._canvas_orig = ImageCanvas()
-        self._canvas_orig.set_mode("none")
-        orig_panel.layout().addWidget(self._canvas_orig)
-        splitter.addWidget(orig_panel)
-
-        # 편집 패널
+        # 중앙: 편집 결과 (전체 너비 사용, 원본은 캔버스 우상단 오버레이로 표시)
         edit_panel = self._make_preview_panel("편집 결과")
         self._canvas_edit = ImageCanvas()
         edit_panel.layout().addWidget(self._canvas_edit)
-        splitter.addWidget(edit_panel)
-
-        splitter.setSizes([500, 500])
-        root.addWidget(splitter, 1)
+        root.addWidget(edit_panel, 1)
 
         # 레이어 패널 (오른쪽)
         self._layer_panel = LayerPanel()
@@ -283,6 +269,7 @@ class MainWindow(QMainWindow):
             ("Escape",      self._on_shortcut_escape),
             ("Return",      self._on_shortcut_enter),
             ("Enter",       self._on_shortcut_enter),
+            ("V",           lambda: self._set_tool_mode("none")),   # 이동/선택 모드
             ("A",           self._on_remove_bg_auto),
             ("G",           lambda: self._set_tool_mode("grabcut")),
             ("B",           lambda: self._set_tool_mode("brush")),
@@ -305,8 +292,8 @@ class MainWindow(QMainWindow):
 
     def _on_shortcut_escape(self):
         self._canvas_edit.cancel_polygon()
-        self._set_tool_mode("none")
-        self._status.set_message("모드 초기화")
+        self._set_tool_mode("none")   # 툴바 이동/선택 버튼도 자동 활성화됨
+        self._status.set_message("이동 / 선택 모드")
 
     def _on_shortcut_enter(self):
         """Enter: 다각형 완성 또는 크기 크롭 확정"""
@@ -347,12 +334,13 @@ class MainWindow(QMainWindow):
     def _load_file(self, path: str):
         try:
             img = self._processor.load(path)
-            self._canvas_orig.set_image(self._processor.original_image)
             self._canvas_edit.set_image(img)
+            self._canvas_edit.set_original_image(self._processor.original_image)
             w, h = self._processor.get_size()
             self._status.set_size(w, h)
             self._status.set_message(f"파일 로드 완료: {path}")
             self._update_edit_state()
+            self._do_refresh_layer_panel()   # 기본 이미지 로드 후 레이어 패널 즉시 갱신
         except Exception as e:
             QMessageBox.critical(self, "오류", f"파일을 열 수 없습니다:\n{e}")
 
@@ -406,11 +394,46 @@ class MainWindow(QMainWindow):
             self._add_overlay(path)
 
     def _on_delete_overlay(self, index: int):
-        self._canvas_edit.remove_overlay(index)
-        self._status.set_message("레이어 삭제")
+        if index == -1:
+            # 기본 이미지 삭제
+            reply = QMessageBox.question(
+                self, "삭제 확인",
+                "기본 이미지를 삭제하시겠습니까?\n모든 레이어와 편집 내용이 초기화됩니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._canvas_edit.clear_overlays()
+            self._canvas_edit.set_base_visible(True)
+            self._canvas_edit._pil_image = None
+            self._canvas_edit._pixmap = None
+            self._canvas_edit._orig_pixmap = None
+            self._canvas_edit.update()
+            self._processor._original = None
+            self._processor._current = None
+            self._processor._history.clear()
+            self._processor._redo_stack.clear()
+            self._do_refresh_layer_panel()
+            self._update_edit_state()
+            self._status.set_message("기본 이미지를 삭제했습니다.")
+        else:
+            reply = QMessageBox.question(
+                self, "삭제 확인",
+                "이 레이어를 삭제하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._canvas_edit.remove_overlay(index)
+            self._status.set_message("레이어 삭제")
 
     def _on_toggle_overlay_vis(self, index: int, visible: bool):
-        self._canvas_edit.set_overlay_visible(index, visible)
+        if index == -1:
+            self._canvas_edit.set_base_visible(visible)
+        else:
+            self._canvas_edit.set_overlay_visible(index, visible)
         self._canvas_edit.update()
 
     def _on_merge_all_overlays(self):
@@ -536,6 +559,7 @@ class MainWindow(QMainWindow):
             self._canvas_edit.set_image(img)
             self._status.set_message(f"GrabCut 완료: ({x},{y}) {w}×{h}")
             self._update_edit_state()
+            self._set_tool_mode("none")   # 작업 후 이동/선택 모드로 자동 복귀
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
             self._status.set_message("GrabCut 실패")
@@ -549,6 +573,7 @@ class MainWindow(QMainWindow):
             self._canvas_edit.set_image(img)
             self._status.set_message(f"다각형 선택 완료: 꼭짓점 {len(points)}개")
             self._update_edit_state()
+            self._set_tool_mode("none")   # 작업 후 이동/선택 모드로 자동 복귀
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 

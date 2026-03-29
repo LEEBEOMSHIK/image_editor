@@ -180,8 +180,8 @@ class LayerPanel(QWidget):
             row = _LayerRow(name=name, visible=ov.get('visible', True),
                             selected=(i == active_idx), thumb=thumb)
             ii = i
-            row.sig_select.connect(lambda _, idx=ii: self.sig_select.emit(idx))
-            row.sig_delete.connect(lambda _, idx=ii: self.sig_delete.emit(idx))
+            row.sig_select.connect(lambda idx=ii: self.sig_select.emit(idx))
+            row.sig_delete.connect(lambda idx=ii: self.sig_delete.emit(idx))
             row.sig_toggle_vis.connect(lambda v, idx=ii: self.sig_toggle_vis.emit(idx, v))
             self._list_layout.insertWidget(insert_pos, row)
             self._rows.append(row)
@@ -190,8 +190,9 @@ class LayerPanel(QWidget):
         # 기본 이미지 행 (항상 맨 아래)
         base_row = _LayerRow(name="기본 이미지", visible=True,
                              selected=(active_idx == -1))
-        base_row.btn_vis.setEnabled(False)
         base_row.sig_select.connect(lambda: self.sig_select.emit(-1))
+        base_row.sig_delete.connect(lambda: self.sig_delete.emit(-1))
+        base_row.sig_toggle_vis.connect(lambda v: self.sig_toggle_vis.emit(-1, v))
         self._list_layout.insertWidget(insert_pos, base_row)
         self._rows.append(base_row)
 

@@ -92,9 +92,15 @@ class ImageCanvas(QLabel):
         self._left_pan_start: QPoint | None = None
         self._left_pan_start_offset: QPoint | None = None
 
-        # 미니맵
-        self._minimap_w = 160
+        # 기본 이미지 가시성 / 선택
+        self._base_visible: bool = True
+        self._base_selected: bool = False   # 레이어 패널에서 기본 이미지 선택 시 True
+
+        # 원본 이미지 미리보기 (우상단 고정)
+        self._orig_pixmap: QPixmap | None = None          # 원본 이미지 픽스맵
+        self._minimap_w = 160                             # 미리보기 너비 (리사이즈 가능)
         self._minimap_resize_start: tuple | None = None  # (start_pos, start_w)
+        self._minimap_hovered: bool = False               # 미니맵 위에 마우스 있는지
 
         # 드래그 앤 드롭 활성화
         self.setAcceptDrops(True)
@@ -106,6 +112,17 @@ class ImageCanvas(QLabel):
         self._pil_image = pil_img
         self._refresh_pixmap()
         self._init_brush_mask()
+
+    def set_original_image(self, pil_img: Image.Image):
+        """원본 이미지를 우상단 미리보기용으로 저장"""
+        if pil_img is None:
+            self._orig_pixmap = None
+            return
+        img = pil_img.convert("RGBA")
+        data = img.tobytes("raw", "RGBA")
+        qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+        self._orig_pixmap = QPixmap.fromImage(qimg)
+        self.update()
 
     def set_mode(self, mode: str):
         self._mode = mode
@@ -193,8 +210,14 @@ class ImageCanvas(QLabel):
             self._overlays[index]['visible'] = visible
             self.update()
 
+    def set_base_visible(self, visible: bool):
+        """기본 이미지 가시성 전환"""
+        self._base_visible = visible
+        self.update()
+
     def select_overlay(self, index: int):
         self._active_overlay = index
+        self._base_selected = (index == -1)   # -1이면 기본 이미지 선택
         self.overlay_selected.emit(index)
         self.update()
 
@@ -324,7 +347,22 @@ class ImageCanvas(QLabel):
 
         if self._pixmap:
             rect = self.get_image_rect()
-            painter.drawPixmap(rect, self._pixmap)
+            if self._base_visible:
+                painter.drawPixmap(rect, self._pixmap)
+            else:
+                # 기본 이미지 숨김: 체스판 패턴으로 투명 영역 표시
+                checker_size = 12
+                c1, c2 = QColor(0x3a, 0x3a, 0x4e), QColor(0x2a, 0x2a, 0x3e)
+                for row in range((rect.height() // checker_size) + 1):
+                    for col in range((rect.width() // checker_size) + 1):
+                        color = c1 if (row + col) % 2 == 0 else c2
+                        painter.fillRect(
+                            rect.x() + col * checker_size,
+                            rect.y() + row * checker_size,
+                            min(checker_size, rect.right() - (rect.x() + col * checker_size)),
+                            min(checker_size, rect.bottom() - (rect.y() + row * checker_size)),
+                            color,
+                        )
 
             if self._brush_overlay:
                 painter.setOpacity(0.5)
@@ -352,6 +390,7 @@ class ImageCanvas(QLabel):
                 # 선택된 오버레이 테두리 및 리사이즈 핸들
                 if i == self._active_overlay:
                     painter.setPen(QPen(QColor(89, 180, 250), 2, Qt.PenStyle.DashLine))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawRect(ov_rect)
                     # 코너 리사이즈 핸들
                     handles = self._get_corner_handles(i)
@@ -360,60 +399,84 @@ class ImageCanvas(QLabel):
                     for h_rect in handles:
                         painter.drawRect(h_rect)
 
+            # 기본 이미지 선택 시 테두리 표시
+            if self._base_selected:
+                br = rect.adjusted(-2, -2, 2, 2)
+                painter.setPen(QPen(QColor(89, 180, 250), 2, Qt.PenStyle.DashLine))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(br)
+                # 크기 표시 레이블
+                if self._pil_image:
+                    iw, ih = self._pil_image.size
+                    painter.setPen(QColor(0x89, 0xb4, 0xfa))
+                    f = painter.font()
+                    f.setBold(True)
+                    f.setPointSize(8)
+                    painter.setFont(f)
+                    lbl = f"기본 이미지  {iw} × {ih} px"
+                    painter.fillRect(
+                        br.x(), br.y() - 18, len(lbl) * 6 + 10, 16,
+                        QColor(0x1e, 0x3a, 0x5f, 200),
+                    )
+                    painter.drawText(br.x() + 5, br.y() - 5, lbl)
+
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         self._paint_overlays(painter)
         self._paint_minimap(painter)
         painter.end()
 
     def _paint_minimap(self, painter: QPainter):
-        if self._pixmap is None:
+        """우상단에 원본 이미지 미리보기를 그린다."""
+        if self._orig_pixmap is None:
             return
         mr = self._minimap_rect()
         if mr.isEmpty():
             return
-        # 배경 + 테두리
-        painter.setOpacity(0.85)
-        painter.fillRect(mr, QColor(0x18, 0x18, 0x25))
+
+        HEADER_H = 18   # "원본" 레이블 높이
+
+        # 배경
+        painter.setOpacity(0.90)
+        painter.fillRect(mr, QColor(0x12, 0x12, 0x1e))
         painter.setOpacity(1.0)
-        painter.setPen(QPen(QColor(0x45, 0x47, 0x5a), 1))
+        # 테두리
+        painter.setPen(QPen(QColor(0x89, 0xb4, 0xfa), 1))
         painter.drawRect(mr)
-        # 이미지
-        pm = self._pixmap.scaled(
-            mr.width() - 2, mr.height() - 2,
+
+        # "원본" 헤더 바
+        header_r = QRect(mr.x() + 1, mr.y() + 1, mr.width() - 2, HEADER_H)
+        painter.fillRect(header_r, QColor(0x1e, 0x3a, 0x5f))
+        painter.setPen(QColor(0x89, 0xb4, 0xfa))
+        f = painter.font()
+        f.setBold(True)
+        f.setPointSize(8)
+        painter.setFont(f)
+        painter.drawText(header_r, Qt.AlignmentFlag.AlignCenter, "원본")
+
+        # 이미지 영역
+        img_area = QRect(mr.x() + 1, mr.y() + HEADER_H + 1,
+                         mr.width() - 2, mr.height() - HEADER_H - 2)
+        pm = self._orig_pixmap.scaled(
+            img_area.width(), img_area.height(),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        px = mr.x() + (mr.width() - pm.width()) // 2
-        py = mr.y() + (mr.height() - pm.height()) // 2
+        px = img_area.x() + (img_area.width() - pm.width()) // 2
+        py = img_area.y() + (img_area.height() - pm.height()) // 2
         painter.drawPixmap(px, py, pm)
-        # 현재 뷰포트 표시
-        img_rect = self.get_image_rect()
-        if img_rect.width() > 0 and img_rect.height() > 0:
-            ww, wh = float(self.width()), float(self.height())
-            vx1 = max(0.0, min(1.0, (0 - img_rect.x()) / img_rect.width()))
-            vy1 = max(0.0, min(1.0, (0 - img_rect.y()) / img_rect.height()))
-            vx2 = max(0.0, min(1.0, (ww - img_rect.x()) / img_rect.width()))
-            vy2 = max(0.0, min(1.0, (wh - img_rect.y()) / img_rect.height()))
-            vr = QRect(
-                int(px + vx1 * pm.width()),
-                int(py + vy1 * pm.height()),
-                max(2, int((vx2 - vx1) * pm.width())),
-                max(2, int((vy2 - vy1) * pm.height())),
-            )
-            painter.setPen(QPen(QColor(89, 180, 250, 200), 1))
-            painter.fillRect(vr, QColor(89, 180, 250, 35))
-            painter.drawRect(vr)
-        # 리사이즈 핸들 (우하단 삼각형)
-        hs = 10
-        rx, ry = mr.right(), mr.bottom()
-        pts = QPolygon([
-            QPoint(rx - hs, ry),
-            QPoint(rx, ry),
-            QPoint(rx, ry - hs),
-        ])
-        painter.setBrush(QBrush(QColor(0x45, 0x47, 0x5a)))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawPolygon(pts)
+
+        # 리사이즈 핸들 (우하단 삼각형) — 호버 시에만 표시
+        if self._minimap_hovered:
+            hs = 10
+            rx, ry = mr.right(), mr.bottom()
+            pts = QPolygon([
+                QPoint(rx - hs, ry),
+                QPoint(rx, ry),
+                QPoint(rx, ry - hs),
+            ])
+            painter.setBrush(QBrush(QColor(0x89, 0xb4, 0xfa)))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(pts)
 
     def _paint_overlays(self, painter: QPainter):
         # ── 드래그 선택 (크롭=파랑, GrabCut=주황) ─────────────────────
@@ -500,6 +563,12 @@ class ImageCanvas(QLabel):
     # ------------------------------------------------------------------ #
     #  이벤트
     # ------------------------------------------------------------------ #
+    def leaveEvent(self, event):
+        if self._minimap_hovered:
+            self._minimap_hovered = False
+            self.update()
+        super().leaveEvent(event)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._pil_image:
@@ -539,14 +608,16 @@ class ImageCanvas(QLabel):
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        # MODE_NONE: 오버레이 선택 / 드래그
-        if self._mode == self.MODE_NONE and self._overlays:
-            hit = self._hit_overlay(pos)
+        # MODE_NONE: 오버레이 선택 / 드래그 / 패닝
+        if self._mode == self.MODE_NONE:
+            hit = self._hit_overlay(pos) if self._overlays else -1
+
             if hit >= 0:
-                # Check for resize handle first
+                # 코너 리사이즈 핸들 우선 검사
                 corner = self._hit_corner_handle(pos, hit)
                 if corner >= 0:
                     self._active_overlay = hit
+                    self._base_selected = False
                     self._ov_resize_corner = corner
                     ov = self._overlays[hit]
                     self._ov_resize_start = (
@@ -565,8 +636,9 @@ class ImageCanvas(QLabel):
                     self.overlay_selected.emit(hit)
                     self.update()
                     return
-                # Otherwise normal drag...
+                # 오버레이 드래그
                 self._active_overlay = hit
+                self._base_selected = False
                 self._ov_drag_start = pos
                 self._ov_drag_start_pos = (
                     self._overlays[hit]['x'], self._overlays[hit]['y']
@@ -576,11 +648,11 @@ class ImageCanvas(QLabel):
                 self.update()
                 return
             else:
-                # 빈 공간 클릭 → 선택 해제
+                # 빈 공간 클릭 → 선택 해제 + 캔버스 패닝
                 self._active_overlay = -1
+                self._base_selected = False
                 self.overlay_selected.emit(-1)
                 self.update()
-                # Left-button pan when clicking empty area in none mode
                 self._left_pan_start = pos
                 self._left_pan_start_offset = QPoint(self._pan_offset)
                 self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
@@ -642,47 +714,40 @@ class ImageCanvas(QLabel):
             corner = self._ov_resize_corner
             MIN_SIZE = 20
             idx = self._active_overlay
-            if 0 <= idx < len(self._overlays) and self._pil_image:
-                iw, ih = self._pil_image.size
+            if 0 <= idx < len(self._overlays):
                 ov = self._overlays[idx]
                 if corner == 0:   # TL
                     new_w = max(MIN_SIZE, orig_w - dx)
                     new_h = max(MIN_SIZE, orig_h - dy)
-                    ov['x'] = max(0, ox + orig_w - new_w)
-                    ov['y'] = max(0, oy + orig_h - new_h)
+                    ov['x'] = ox + orig_w - new_w
+                    ov['y'] = oy + orig_h - new_h
                 elif corner == 1:  # TR
                     new_w = max(MIN_SIZE, orig_w + dx)
                     new_h = max(MIN_SIZE, orig_h - dy)
-                    ov['y'] = max(0, oy + orig_h - new_h)
+                    ov['y'] = oy + orig_h - new_h
                 elif corner == 2:  # BL
                     new_w = max(MIN_SIZE, orig_w - dx)
                     new_h = max(MIN_SIZE, orig_h + dy)
-                    ov['x'] = max(0, ox + orig_w - new_w)
+                    ov['x'] = ox + orig_w - new_w
                 else:              # BR
                     new_w = max(MIN_SIZE, orig_w + dx)
                     new_h = max(MIN_SIZE, orig_h + dy)
-                ov['disp_w'] = min(new_w, iw)
-                ov['disp_h'] = min(new_h, ih)
+                ov['disp_w'] = new_w
+                ov['disp_h'] = new_h
                 self.update()
             return
 
-        # 오버레이 드래그
+        # 오버레이 드래그 (기본 이미지 영역 밖으로도 자유롭게 이동)
         if self._ov_drag_start is not None and self._ov_drag_start_pos is not None:
             delta = pos - self._ov_drag_start
             s = self._scale * self._zoom
-            if s > 0:
-                dx = int(delta.x() / s)
-                dy = int(delta.y() / s)
-            else:
-                dx = dy = 0
+            dx = int(delta.x() / s) if s > 0 else 0
+            dy = int(delta.y() / s) if s > 0 else 0
             idx = self._active_overlay
-            if 0 <= idx < len(self._overlays) and self._pil_image:
-                iw, ih = self._pil_image.size
+            if 0 <= idx < len(self._overlays):
                 ov = self._overlays[idx]
-                ov['x'] = max(0, min(self._ov_drag_start_pos[0] + dx,
-                                     iw - ov.get('disp_w', ov['pil'].width)))
-                ov['y'] = max(0, min(self._ov_drag_start_pos[1] + dy,
-                                     ih - ov.get('disp_h', ov['pil'].height)))
+                ov['x'] = self._ov_drag_start_pos[0] + dx
+                ov['y'] = self._ov_drag_start_pos[1] + dy
                 self.update()
             return
 
@@ -718,6 +783,9 @@ class ImageCanvas(QLabel):
             self.update()
         elif self._mode == self.MODE_BRUSH and self._drawing:
             self._draw_brush(pos)
+
+        # 호버 상태 업데이트 (미니맵 + 오버레이 커서)
+        self._update_hover_state(pos)
 
     def mouseReleaseEvent(self, event):
         pos = event.position().toPoint()
@@ -826,6 +894,47 @@ class ImageCanvas(QLabel):
     # ------------------------------------------------------------------ #
     #  내부 유틸
     # ------------------------------------------------------------------ #
+    def _update_hover_state(self, pos: QPoint):
+        """미니맵 호버 및 MODE_NONE 커서 업데이트"""
+        mr = self._minimap_rect()
+        prev_hovered = self._minimap_hovered
+        self._minimap_hovered = not mr.isEmpty() and mr.contains(pos)
+        if prev_hovered != self._minimap_hovered:
+            self.update()
+
+        # 커서는 드래그 없는 MODE_NONE 일 때만 변경
+        if (self._ov_drag_start is not None or self._ov_resize_start is not None
+                or self._left_pan_start is not None or self._pan_start is not None):
+            return
+
+        if self._minimap_hovered:
+            hs = 10
+            resize_zone = QRect(mr.right() - hs, mr.bottom() - hs, hs, hs)
+            self.setCursor(QCursor(
+                Qt.CursorShape.SizeFDiagCursor if resize_zone.contains(pos)
+                else Qt.CursorShape.ArrowCursor
+            ))
+            return
+
+        if self._mode != self.MODE_NONE:
+            return
+
+        hit = self._hit_overlay(pos)
+        if hit >= 0:
+            corner = self._hit_corner_handle(pos, hit)
+            if corner >= 0:
+                resize_cursors = [
+                    Qt.CursorShape.SizeFDiagCursor,
+                    Qt.CursorShape.SizeBDiagCursor,
+                    Qt.CursorShape.SizeBDiagCursor,
+                    Qt.CursorShape.SizeFDiagCursor,
+                ]
+                self.setCursor(QCursor(resize_cursors[corner]))
+            else:
+                self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        else:
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
     def _overlay_widget_rect(self, index: int) -> QRect:
         """오버레이의 위젯 좌표 사각형"""
         ov = self._overlays[index]
@@ -855,11 +964,13 @@ class ImageCanvas(QLabel):
         return -1
 
     def _minimap_rect(self) -> QRect:
-        """미니맵 사각형 (위젯 우상단 고정)"""
-        if self._pixmap is None:
+        """원본 미리보기 사각형 (위젯 우상단 고정)"""
+        src = self._orig_pixmap or self._pixmap
+        if src is None:
             return QRect()
-        aspect = self._pixmap.height() / max(self._pixmap.width(), 1)
-        mh = max(40, int(self._minimap_w * aspect))
+        HEADER_H = 18
+        aspect = src.height() / max(src.width(), 1)
+        mh = max(60, int(self._minimap_w * aspect) + HEADER_H)
         margin = 8
         x = self.width() - self._minimap_w - margin
         y = margin

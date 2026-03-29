@@ -4,7 +4,7 @@ ui/toolbar.py
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel,
-    QSlider, QSpinBox, QHBoxLayout, QComboBox, QFrame
+    QSlider, QSpinBox, QHBoxLayout, QComboBox, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -95,10 +95,30 @@ class Toolbar(QWidget):
         super().__init__(parent)
         self.setFixedWidth(210)
         self.setStyleSheet("background-color: #181825; border-right: 1px solid #313244;")
-        self._build_ui()
 
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
+        # 세로 스크롤 가능한 내용 영역
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+            "QScrollBar:vertical { background: #181825; width: 5px; margin: 0; }"
+            "QScrollBar::handle:vertical { background: #45475a; border-radius: 2px; min-height: 20px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        self._build_ui(content)
+
+    def _build_ui(self, parent: QWidget):
+        layout = QVBoxLayout(parent)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(4)
 
@@ -128,6 +148,19 @@ class Toolbar(QWidget):
         row.addWidget(self.btn_undo)
         row.addWidget(self.btn_redo)
         layout.addLayout(row)
+
+        layout.addWidget(self._separator())
+
+        # ── 모드: 이동 / 선택 ──────────────────────────
+        layout.addWidget(SectionLabel("🖐  모드"))
+        self.btn_move = ToolButton("🖐 이동 / 선택  (V)")
+        self.btn_move.setToolTip(
+            "이동·선택 모드  (단축키: V 또는 Escape)\n"
+            "오버레이 이미지를 클릭해 선택·이동하거나\n"
+            "빈 공간을 드래그해 캔버스를 이동합니다."
+        )
+        self.btn_move.clicked.connect(self._on_move_toggle)
+        layout.addWidget(self.btn_move)
 
         layout.addWidget(self._separator())
 
@@ -289,11 +322,16 @@ class Toolbar(QWidget):
     #  토글 핸들러
     # ------------------------------------------------------------------ #
     def _all_mode_buttons(self):
-        return [self.btn_grabcut, self.btn_brush, self.btn_crop_drag, self.btn_polygon]
+        return [self.btn_move, self.btn_grabcut, self.btn_brush, self.btn_crop_drag, self.btn_polygon]
 
     def _clear_mode_buttons(self):
         for btn in self._all_mode_buttons():
             btn.setChecked(False)
+
+    def _on_move_toggle(self):
+        self._clear_mode_buttons()
+        self.btn_move.setChecked(True)
+        self.sig_mode_changed.emit("none")
 
     def _on_grabcut_toggle(self):
         self._clear_mode_buttons()
@@ -332,6 +370,7 @@ class Toolbar(QWidget):
     def set_mode(self, mode: str):
         self._clear_mode_buttons()
         mapping = {
+            "none":    self.btn_move,
             "grabcut": self.btn_grabcut,
             "brush":   self.btn_brush,
             "crop":    self.btn_crop_drag,
