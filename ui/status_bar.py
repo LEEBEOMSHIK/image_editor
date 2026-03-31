@@ -22,7 +22,9 @@ class StatusBar(QStatusBar):
         self._lbl_zoom = QLabel("줌: 100%")
         self._lbl_zoom.setStyleSheet(lbl_style)
         self._lbl_size = QLabel("")
-        self._lbl_size.setStyleSheet(lbl_style)
+        self._lbl_size.setStyleSheet(
+            "color: #a6e3a1; padding: 0 8px; font-weight: bold;"
+        )
         self.addWidget(self._lbl_info, 1)
         self.addPermanentWidget(self._lbl_zoom)
         self.addPermanentWidget(self._lbl_size)
@@ -31,7 +33,7 @@ class StatusBar(QStatusBar):
         self._lbl_info.setText(msg)
 
     def set_size(self, w: int, h: int):
-        self._lbl_size.setText(f"{w} × {h} px")
+        self._lbl_size.setText(f"작업 크기: {w} × {h} px")
 
     def set_zoom(self, zoom: float):
         self._lbl_zoom.setText(f"줌: {int(zoom * 100)}%")

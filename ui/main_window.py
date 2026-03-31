@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 )
 import os
 import sys
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QPoint
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut, QIcon
 
 from core.image_processor import ImageProcessor
@@ -18,6 +18,8 @@ from ui.toolbar import Toolbar
 from ui.status_bar import StatusBar
 from ui.export_dialog import ExportDialog
 from ui.layer_panel import LayerPanel
+from ui.new_document_dialog import NewDocumentDialog
+from ui.quick_tool_panel import QuickToolPanel
 
 
 # ------------------------------------------------------------------ #
@@ -60,6 +62,9 @@ class MainWindow(QMainWindow):
         self._grabcut_rect = None    # GrabCut 선택 사각형 저장
         self._thread = None
         self._worker = None
+        self._current_tool_color: tuple = (0, 0, 0, 255)   # 색상 도구 현재 색
+        self._color_brush_pending_mask = None               # 색상 브러시 누적 마스크
+        self._bg_remove_target_idx: int = -1               # AI 배경 제거 대상 오버레이 인덱스
 
         self._layer_refresh_timer = QTimer(self)
         self._layer_refresh_timer.setSingleShot(True)
@@ -79,6 +84,9 @@ class MainWindow(QMainWindow):
         # exe에 파일을 드롭하거나 커맨드라인 인수로 열기
         if initial_path:
             self._load_file(initial_path)
+        else:
+            # 시작 시 새 문서 다이얼로그 표시
+            self._show_new_document_dialog()
 
     # ------------------------------------------------------------------ #
     #  테마
@@ -131,24 +139,42 @@ class MainWindow(QMainWindow):
         self._status = StatusBar()
         self.setStatusBar(self._status)
 
-    @staticmethod
-    def _make_preview_panel(title: str) -> QWidget:
+        # 퀵 도구 패널 (캔버스 위에 오버레이로 표시, 드래그 가능)
+        self._quick_panel = QuickToolPanel(central)
+        self._quick_panel.raise_()
+
+    def _make_preview_panel(self, title: str) -> QWidget:
         w = QWidget()
         w.setStyleSheet("background-color: #1e1e2e;")
         layout = QVBoxLayout(w)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        # 헤더 바 (제목 + 작업 크기 표시)
+        header_bar = QWidget()
+        header_bar.setStyleSheet(
+            "background-color: #181825; border-bottom: 1px solid #313244;"
+        )
+        h_lay = QHBoxLayout(header_bar)
+        h_lay.setContentsMargins(8, 0, 12, 0)
+        h_lay.setSpacing(0)
+
         lbl = QLabel(f"  {title}")
-        lbl.setStyleSheet("""
-            background-color: #181825;
-            color: #a6adc8;
-            font-size: 11px;
-            font-weight: bold;
-            letter-spacing: 1px;
-            padding: 6px;
-            border-bottom: 1px solid #313244;
-        """)
-        layout.addWidget(lbl)
+        lbl.setStyleSheet(
+            "background: transparent; color: #a6adc8; font-size: 11px;"
+            "font-weight: bold; letter-spacing: 1px; padding: 6px 0;"
+        )
+        h_lay.addWidget(lbl)
+        h_lay.addStretch()
+
+        self._workspace_size_lbl = QLabel("")
+        self._workspace_size_lbl.setStyleSheet(
+            "background: transparent; color: #a6e3a1; font-size: 11px;"
+            "font-weight: bold; padding: 6px 0;"
+        )
+        h_lay.addWidget(self._workspace_size_lbl)
+
+        layout.addWidget(header_bar)
         return w
 
     # ------------------------------------------------------------------ #
@@ -158,6 +184,14 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("파일(&F)")
+
+        act_new = QAction("새 문서(&N)", self)
+        act_new.setShortcut(QKeySequence("Ctrl+N"))
+        act_new.triggered.connect(self._show_new_document_dialog)
+        file_menu.addAction(act_new)
+
+        file_menu.addSeparator()
+
         act_open = QAction("열기(&O)", self)
         act_open.setShortcut(QKeySequence.StandardKey.Open)
         act_open.triggered.connect(self._on_open)
@@ -184,6 +218,14 @@ class MainWindow(QMainWindow):
         act_redo.setShortcut(QKeySequence.StandardKey.Redo)
         act_redo.triggered.connect(self._on_redo)
         edit_menu.addAction(act_redo)
+
+        edit_menu.addSeparator()
+
+        self._act_quick_tool = QAction("퀵 도구 패널 표시(&Q)", self)
+        self._act_quick_tool.setCheckable(True)
+        self._act_quick_tool.setChecked(True)
+        self._act_quick_tool.triggered.connect(self._toggle_quick_panel)
+        edit_menu.addAction(self._act_quick_tool)
 
         help_menu = menubar.addMenu("도움말(&H)")
         act_help = QAction("사용 설명서(&M)", self)
@@ -241,6 +283,24 @@ class MainWindow(QMainWindow):
         # 도움말
         tb.sig_help.connect(self._show_help)
 
+        # 색상 도구
+        self._canvas_edit.color_sampled.connect(self._on_color_sampled)
+        self._canvas_edit.fill_applied.connect(self._on_fill_applied)
+        self._canvas_edit.color_brush_done.connect(self._on_color_brush_done)
+        tb.sig_apply_color_brush.connect(self._on_apply_color_brush)
+        tb.sig_clear_color_brush.connect(self._on_clear_color_brush)
+        tb.sig_color_changed.connect(self._on_tool_color_changed)
+
+        # 도형 그리기 / AI 인페인팅
+        self._canvas_edit.shape_committed.connect(self._on_shape_committed)
+        self._canvas_edit.inpaint_committed.connect(self._on_inpaint_committed)
+
+        # 퀵 도구 패널
+        qp = self._quick_panel
+        qp.sig_mode_changed.connect(self._set_tool_mode)
+        qp.sig_action.connect(self._on_quick_action)
+        qp.sig_closed.connect(lambda: self._act_quick_tool.setChecked(False))
+
         # 캔버스 드롭 → 기본 이미지 or 오버레이
         self._canvas_edit.file_dropped.connect(self._on_canvas_file_dropped)
 
@@ -260,6 +320,8 @@ class MainWindow(QMainWindow):
         lp.sig_delete.connect(self._on_delete_overlay)
         lp.sig_toggle_vis.connect(self._on_toggle_overlay_vis)
         lp.sig_merge_all.connect(self._on_merge_all_overlays)
+        lp.sig_reset_size.connect(self._on_overlay_reset_size)
+        lp.sig_fit_to_canvas.connect(self._on_overlay_fit_canvas)
 
     # ------------------------------------------------------------------ #
     #  단축키
@@ -286,9 +348,45 @@ class MainWindow(QMainWindow):
             QShortcut(QKeySequence(key), self).activated.connect(slot)
 
     def _set_tool_mode(self, mode: str):
-        """단축키로 모드 전환 — 툴바 버튼과 캔버스를 동기화"""
+        """단축키로 모드 전환 — 툴바·퀵패널·캔버스를 동기화"""
         self._toolbar.set_mode(mode)
+        self._quick_panel.set_mode(mode)
         self._on_mode_changed(mode)
+
+    # ------------------------------------------------------------------ #
+    #  새 문서
+    # ------------------------------------------------------------------ #
+    def _show_new_document_dialog(self):
+        """새 문서 다이얼로그 표시 → 선택한 크기로 빈 캔버스 생성"""
+        dlg = NewDocumentDialog(self)
+        if dlg.exec():
+            w, h = dlg.get_size()
+            img = self._processor.new_blank(w, h, (0, 0, 0, 0))
+            self._canvas_edit.set_image(img)
+            self._canvas_edit.set_original_image(None)  # 새 문서는 미니맵 표시 없음
+            self._canvas_edit.clear_overlays()
+            self._status.set_size(w, h)
+            self._status.set_message(f"새 문서: {w} × {h} px")
+            self._workspace_size_lbl.setText(f"작업 크기: {w} × {h} px")
+            self._update_edit_state()
+            self._do_refresh_layer_panel()
+
+    # ------------------------------------------------------------------ #
+    #  퀵 도구 패널 액션
+    # ------------------------------------------------------------------ #
+    def _on_quick_action(self, action: str):
+        if action == "undo":
+            self._on_undo()
+        elif action == "redo":
+            self._on_redo()
+        elif action == "remove_bg":
+            self._on_remove_bg_auto()
+        elif action == "zoom_in":
+            self._canvas_edit.zoom_in()
+        elif action == "zoom_out":
+            self._canvas_edit.zoom_out()
+        elif action == "zoom_fit":
+            self._canvas_edit.reset_zoom()
 
     def _on_shortcut_escape(self):
         self._canvas_edit.cancel_polygon()
@@ -302,6 +400,28 @@ class MainWindow(QMainWindow):
             self._canvas_edit._close_polygon()
         elif mode == "crop_size":
             self._canvas_edit.commit_crop_size()
+
+    # ------------------------------------------------------------------ #
+    #  퀵 패널 초기 위치 지정
+    # ------------------------------------------------------------------ #
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._reposition_quick_panel()
+
+    def _reposition_quick_panel(self):
+        """캔버스 좌상단 기준으로 퀵 패널 위치 설정"""
+        canvas_pos = self._canvas_edit.mapTo(self.centralWidget(), QPoint(0, 0))
+        self._quick_panel.move(canvas_pos.x() + 10, canvas_pos.y() + 10)
+        self._quick_panel.raise_()
+
+    def _toggle_quick_panel(self, checked: bool):
+        """편집 메뉴에서 퀵 도구 패널 표시/숨김 토글"""
+        if checked:
+            self._reposition_quick_panel()
+            self._quick_panel.show()
+            self._quick_panel.raise_()
+        else:
+            self._quick_panel.hide()
 
     # ------------------------------------------------------------------ #
     #  드래그 앤 드롭
@@ -318,7 +438,7 @@ class MainWindow(QMainWindow):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if self._is_image_path(path):
-                # 메인 윈도우 드롭은 항상 기본 이미지로 열기
+                # 파일 크기의 새 캔버스 생성 후 첫 번째 레이어로 추가
                 self._load_file(path)
                 break
         event.acceptProposedAction()
@@ -333,14 +453,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _load_file(self, path: str):
         try:
-            img = self._processor.load(path)
-            self._canvas_edit.set_image(img)
-            self._canvas_edit.set_original_image(self._processor.original_image)
-            w, h = self._processor.get_size()
+            from PIL import Image as _PIL
+            pil_img = _PIL.open(path).convert("RGBA")
+            w, h = pil_img.size
+            # 파일 크기의 투명 캔버스 생성 (작업 공간)
+            canvas_img = self._processor.new_blank(w, h, (0, 0, 0, 0))
+            self._canvas_edit.set_image(canvas_img)
+            self._canvas_edit.set_original_image(pil_img)   # 미니맵 원본
+            self._canvas_edit.clear_overlays()
+            # 파일을 첫 번째 레이어로 추가
+            name = os.path.basename(path)
+            self._canvas_edit.add_overlay(pil_img, name)
             self._status.set_size(w, h)
+            self._workspace_size_lbl.setText(f"작업 크기: {w} × {h} px")
             self._status.set_message(f"파일 로드 완료: {path}")
             self._update_edit_state()
-            self._do_refresh_layer_panel()   # 기본 이미지 로드 후 레이어 패널 즉시 갱신
+            self._do_refresh_layer_panel()
         except Exception as e:
             QMessageBox.critical(self, "오류", f"파일을 열 수 없습니다:\n{e}")
 
@@ -366,7 +494,7 @@ class MainWindow(QMainWindow):
     #  레이어 / 오버레이 핸들러
     # ------------------------------------------------------------------ #
     def _on_canvas_file_dropped(self, path: str, pos):
-        """캔버스에 파일 드롭 — 기본 이미지가 없으면 열기, 있으면 오버레이로 추가"""
+        """캔버스에 파일 드롭 — 항상 레이어로 추가 (작업 공간이 없으면 파일 크기로 생성)"""
         if not self._processor.has_image:
             self._load_file(path)
         else:
@@ -382,59 +510,53 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "오류", f"이미지를 불러올 수 없습니다:\n{e}")
 
+    def _on_overlay_reset_size(self):
+        """선택한 레이어를 원본 크기로 복원"""
+        idx = self._canvas_edit._active_overlay
+        if idx >= 0:
+            self._canvas_edit.reset_overlay_size(idx)
+            self._status.set_message("레이어 원본 크기로 복원됨")
+        else:
+            self._status.set_message("크기를 복원할 레이어를 먼저 선택하세요.")
+
+    def _on_overlay_fit_canvas(self):
+        """선택한 레이어를 캔버스 크기에 맞춤"""
+        idx = self._canvas_edit._active_overlay
+        if idx >= 0:
+            self._canvas_edit.fit_overlay_to_canvas(idx)
+            self._status.set_message("레이어를 캔버스 크기에 맞춤")
+        else:
+            self._status.set_message("크기를 맞출 레이어를 먼저 선택하세요.")
+
     def _on_add_overlay_dialog(self):
-        if not self._processor.has_image:
-            QMessageBox.warning(self, "경고", "먼저 기본 이미지를 열어주세요.")
-            return
         path, _ = QFileDialog.getOpenFileName(
             self, "레이어 이미지 추가", "",
             "이미지 파일 (*.png *.jpg *.jpeg *.bmp *.webp *.tiff *.gif)"
         )
         if path:
-            self._add_overlay(path)
+            if not self._processor.has_image:
+                self._load_file(path)
+            else:
+                self._add_overlay(path)
 
     def _on_delete_overlay(self, index: int):
-        if index == -1:
-            # 기본 이미지 삭제
-            reply = QMessageBox.question(
-                self, "삭제 확인",
-                "기본 이미지를 삭제하시겠습니까?\n모든 레이어와 편집 내용이 초기화됩니다.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            self._canvas_edit.clear_overlays()
-            self._canvas_edit.set_base_visible(True)
-            self._canvas_edit._pil_image = None
-            self._canvas_edit._pixmap = None
-            self._canvas_edit._orig_pixmap = None
-            self._canvas_edit.update()
-            self._processor._original = None
-            self._processor._current = None
-            self._processor._history.clear()
-            self._processor._redo_stack.clear()
-            self._do_refresh_layer_panel()
-            self._update_edit_state()
-            self._status.set_message("기본 이미지를 삭제했습니다.")
-        else:
-            reply = QMessageBox.question(
-                self, "삭제 확인",
-                "이 레이어를 삭제하시겠습니까?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            self._canvas_edit.remove_overlay(index)
-            self._status.set_message("레이어 삭제")
+        if index < 0:
+            return
+        reply = QMessageBox.question(
+            self, "삭제 확인",
+            "이 레이어를 삭제하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._canvas_edit.remove_overlay(index)
+        self._status.set_message("레이어 삭제")
 
     def _on_toggle_overlay_vis(self, index: int, visible: bool):
-        if index == -1:
-            self._canvas_edit.set_base_visible(visible)
-        else:
+        if index >= 0:
             self._canvas_edit.set_overlay_visible(index, visible)
-        self._canvas_edit.update()
+            self._canvas_edit.update()
 
     def _on_merge_all_overlays(self):
         overlays = self._canvas_edit.get_overlays()
@@ -444,14 +566,13 @@ class MainWindow(QMainWindow):
         if not self._processor.has_image:
             return
         try:
-            for ov in overlays:
-                if ov.get('visible', True):
-                    self._processor.merge_overlay(ov['pil'], ov['x'], ov['y'])
-            img = self._processor.current_image
-            self._canvas_edit.set_image(img)
-            self._canvas_edit.clear_overlays()
-            self._status.set_message(f"레이어 {len(overlays)}개 병합 완료")
-            self._update_edit_state()
+            composited = self._get_composited_image()
+            if composited:
+                self._processor.load_pil(composited)
+                self._canvas_edit.set_image(self._processor.current_image)
+                self._canvas_edit.clear_overlays()
+                self._status.set_message(f"레이어 {len(overlays)}개 병합 완료")
+                self._update_edit_state()
         except Exception as e:
             QMessageBox.critical(self, "병합 오류", str(e))
 
@@ -475,7 +596,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_save(self):
-        if not self._processor.has_image:
+        if not self._processor.has_image and not self._canvas_edit.get_overlays():
             QMessageBox.warning(self, "경고", "저장할 이미지가 없습니다.")
             return
         dlg = ExportDialog(self)
@@ -483,7 +604,13 @@ class MainWindow(QMainWindow):
             path, fmt = dlg.get_result()
             if path and fmt:
                 try:
-                    self._processor.save(path, fmt)
+                    composited = self._get_composited_image()
+                    if composited is None:
+                        QMessageBox.warning(self, "경고", "저장할 이미지가 없습니다.")
+                        return
+                    tmp = ImageProcessor()
+                    tmp.load_pil(composited)
+                    tmp.save(path, fmt)
                     self._status.set_message(f"저장 완료: {path}")
                 except Exception as e:
                     QMessageBox.critical(self, "저장 오류", str(e))
@@ -509,25 +636,138 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, mode: str):
         self._canvas_edit.set_mode(mode)
         mode_labels = {
-            "none": "기본 모드",
-            "crop": "드래그로 크롭 영역을 선택하세요",
-            "grabcut": "GrabCut 영역을 드래그로 선택하세요",
-            "brush": "지울 영역을 브러시로 칠하세요 → '브러시 적용' 클릭",
+            "none":          "기본 모드",
+            "crop":          "드래그로 크롭 영역을 선택하세요",
+            "grabcut":       "GrabCut 영역을 드래그로 선택하세요",
+            "brush":         "지울 영역을 브러시로 칠하세요 → '브러시 적용' 클릭",
+            "pipette":       "색을 추출할 픽셀을 클릭하세요",
+            "fill":          "채울 영역을 클릭하세요 (현재 색상으로 채우기)",
+            "color_brush":   "색칠할 영역을 브러시로 칠하세요 → '브러시 적용' 클릭",
+            "shape_rect":    "드래그로 점선 사각형 영역을 지정하세요",
+            "shape_ellipse": "드래그로 점선 원/타원 영역을 지정하세요",
+            "inpaint":       "드래그로 AI 채우기 영역을 선택하세요 — 드래그 완료 시 자동 적용",
         }
         self._status.set_message(mode_labels.get(mode, ""))
+
+    # ------------------------------------------------------------------ #
+    #  레이어 편집 헬퍼
+    # ------------------------------------------------------------------ #
+    def _get_active_overlay_idx(self) -> int:
+        """현재 선택된 오버레이 인덱스 (-1 = 없음)"""
+        return self._canvas_edit._active_overlay
+
+    def _apply_to_overlay(self, idx: int, op_fn) -> bool:
+        """선택된 오버레이에 처리 함수 적용. op_fn: ImageProcessor → Image"""
+        overlays = self._canvas_edit.get_overlays()
+        if not (0 <= idx < len(overlays)):
+            return False
+        tmp = ImageProcessor()
+        tmp.load_pil(overlays[idx]['pil'])
+        result = op_fn(tmp)
+        if result is not None:
+            self._canvas_edit.update_overlay_image(idx, result)
+            return True
+        return False
+
+    def _translate_to_overlay_coords(self, ov: dict, x: int, y: int, w: int, h: int):
+        """워크스페이스 좌표를 오버레이 로컬 픽셀 좌표로 변환"""
+        ox, oy = ov['x'], ov['y']
+        dw, dh = ov['disp_w'], ov['disp_h']
+        pw, ph = ov['pil'].width, ov['pil'].height
+        sx = pw / dw if dw > 0 else 1.0
+        sy = ph / dh if dh > 0 else 1.0
+        x_l = int((x - ox) * sx)
+        y_l = int((y - oy) * sy)
+        w_l = int(w * sx)
+        h_l = int(h * sy)
+        x_l = max(0, min(x_l, pw - 1))
+        y_l = max(0, min(y_l, ph - 1))
+        w_l = max(1, min(w_l, pw - x_l))
+        h_l = max(1, min(h_l, ph - y_l))
+        return x_l, y_l, w_l, h_l
+
+    def _translate_brush_mask_to_overlay(self, mask, ov: dict):
+        """워크스페이스 크기 브러시 마스크를 오버레이 로컬 크기로 변환"""
+        import cv2
+        import numpy as np
+        ox, oy = ov['x'], ov['y']
+        dw, dh = ov['disp_w'], ov['disp_h']
+        pw, ph = ov['pil'].width, ov['pil'].height
+        mh, mw = mask.shape[:2]
+        x1 = max(0, ox)
+        y1 = max(0, oy)
+        x2 = min(mw, ox + dw)
+        y2 = min(mh, oy + dh)
+        if x2 <= x1 or y2 <= y1:
+            return np.zeros((ph, pw), dtype=np.uint8)
+        crop = mask[y1:y2, x1:x2]
+        return cv2.resize(crop, (pw, ph), interpolation=cv2.INTER_NEAREST)
+
+    def _crop_overlay(self, idx: int, x: int, y: int, w: int, h: int):
+        """선택된 오버레이를 워크스페이스 기준 사각형으로 크롭"""
+        overlays = self._canvas_edit.get_overlays()
+        if not (0 <= idx < len(overlays)):
+            return
+        ov = overlays[idx]
+        ox, oy = ov['x'], ov['y']
+        dw, dh = ov['disp_w'], ov['disp_h']
+        pw, ph = ov['pil'].width, ov['pil'].height
+        sx = pw / dw if dw > 0 else 1.0
+        sy = ph / dh if dh > 0 else 1.0
+        ix1 = max(ox, x)
+        iy1 = max(oy, y)
+        ix2 = min(ox + dw, x + w)
+        iy2 = min(oy + dh, y + h)
+        if ix2 <= ix1 or iy2 <= iy1:
+            self._status.set_message("크롭 영역이 레이어와 겹치지 않습니다.")
+            return
+        lx1 = int((ix1 - ox) * sx)
+        ly1 = int((iy1 - oy) * sy)
+        lx2 = int((ix2 - ox) * sx)
+        ly2 = int((iy2 - oy) * sy)
+        new_pil = ov['pil'].crop((lx1, ly1, lx2, ly2))
+        ov['x'] = ix1
+        ov['y'] = iy1
+        self._canvas_edit.update_overlay_image(idx, new_pil)
+        self._status.set_message(f"레이어 크롭 완료: {new_pil.width}×{new_pil.height}")
+
+    def _get_composited_image(self):
+        """보이는 모든 레이어를 기본 캔버스에 합성한 PIL 이미지 반환"""
+        if not self._processor.has_image:
+            return None
+        from PIL import Image as _PIL
+        base = self._processor.current_image.copy().convert("RGBA")
+        for ov in self._canvas_edit.get_overlays():
+            if not ov.get('visible', True):
+                continue
+            pil = ov['pil'].convert("RGBA")
+            if ov['disp_w'] != pil.width or ov['disp_h'] != pil.height:
+                pil = pil.resize((ov['disp_w'], ov['disp_h']), _PIL.LANCZOS)
+            base.paste(pil, (ov['x'], ov['y']), pil)
+        return base
 
     # ------------------------------------------------------------------ #
     #  배경 제거
     # ------------------------------------------------------------------ #
     def _on_remove_bg_auto(self):
-        if not self._processor.has_image:
+        idx = self._get_active_overlay_idx()
+        overlays = self._canvas_edit.get_overlays()
+        if idx >= 0 and idx < len(overlays):
+            tmp = ImageProcessor()
+            tmp.load_pil(overlays[idx]['pil'])
+            self._bg_remove_target_idx = idx
+            proc = tmp
+        elif self._processor.has_image:
+            self._bg_remove_target_idx = -1
+            proc = self._processor
+        else:
             QMessageBox.warning(self, "경고", "이미지를 먼저 불러오세요.")
             return
         self._status.set_message("AI 배경 제거 중... (시간이 걸릴 수 있습니다)")
         self.setEnabled(False)
 
         self._thread = QThread()
-        self._worker = BgRemoveWorker(self._processor)
+        self._worker = BgRemoveWorker(proc)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_bg_removed)
@@ -538,9 +778,16 @@ class MainWindow(QMainWindow):
 
     def _on_bg_removed(self, img):
         self.setEnabled(True)
-        self._canvas_edit.set_image(img)
-        self._status.set_message("배경 제거 완료")
-        self._update_edit_state()
+        idx = self._bg_remove_target_idx
+        if idx >= 0:
+            self._canvas_edit.update_overlay_image(idx, img)
+            self._status.set_message("레이어 배경 제거 완료")
+            self._do_refresh_layer_panel()
+        else:
+            self._canvas_edit.set_image(img)
+            self._status.set_message("배경 제거 완료")
+            self._update_edit_state()
+        self._bg_remove_target_idx = -1
 
     def _on_bg_error(self, msg: str):
         self.setEnabled(True)
@@ -549,47 +796,206 @@ class MainWindow(QMainWindow):
 
     def _on_grabcut_auto_apply(self, x: int, y: int, w: int, h: int):
         """GrabCut 드래그 완료 즉시 자동 적용"""
-        if not self._processor.has_image:
-            return
         if w < 5 or h < 5:
             return
         self._status.set_message("GrabCut 처리 중...")
+        idx = self._get_active_overlay_idx()
         try:
-            img = self._processor.remove_background_grabcut((x, y, w, h))
-            self._canvas_edit.set_image(img)
-            self._status.set_message(f"GrabCut 완료: ({x},{y}) {w}×{h}")
-            self._update_edit_state()
-            self._set_tool_mode("none")   # 작업 후 이동/선택 모드로 자동 복귀
+            if idx >= 0:
+                overlays = self._canvas_edit.get_overlays()
+                if 0 <= idx < len(overlays):
+                    ov = overlays[idx]
+                    lx, ly, lw, lh = self._translate_to_overlay_coords(ov, x, y, w, h)
+                    if self._apply_to_overlay(idx, lambda p: p.remove_background_grabcut((lx, ly, lw, lh))):
+                        self._status.set_message(f"레이어 GrabCut 완료: {lw}×{lh}")
+            elif self._processor.has_image:
+                img = self._processor.remove_background_grabcut((x, y, w, h))
+                self._canvas_edit.set_image(img)
+                self._status.set_message(f"GrabCut 완료: ({x},{y}) {w}×{h}")
+                self._update_edit_state()
+            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
             self._status.set_message("GrabCut 실패")
 
     def _on_polygon_cut(self, points: list):
         """다각형 닫힘 즉시 적용"""
-        if not self._processor.has_image:
-            return
+        idx = self._get_active_overlay_idx()
         try:
-            img = self._processor.crop_by_polygon(points)
-            self._canvas_edit.set_image(img)
-            self._status.set_message(f"다각형 선택 완료: 꼭짓점 {len(points)}개")
-            self._update_edit_state()
-            self._set_tool_mode("none")   # 작업 후 이동/선택 모드로 자동 복귀
+            if idx >= 0:
+                overlays = self._canvas_edit.get_overlays()
+                if 0 <= idx < len(overlays):
+                    ov = overlays[idx]
+                    ox, oy = ov['x'], ov['y']
+                    dw, dh = ov['disp_w'], ov['disp_h']
+                    pw, ph = ov['pil'].width, ov['pil'].height
+                    sx = pw / dw if dw > 0 else 1.0
+                    sy = ph / dh if dh > 0 else 1.0
+                    local_pts = [(int((px - ox) * sx), int((py - oy) * sy)) for px, py in points]
+                    if self._apply_to_overlay(idx, lambda p: p.crop_by_polygon(local_pts)):
+                        self._status.set_message(f"레이어 다각형 선택 완료: 꼭짓점 {len(points)}개")
+            elif self._processor.has_image:
+                img = self._processor.crop_by_polygon(points)
+                self._canvas_edit.set_image(img)
+                self._status.set_message(f"다각형 선택 완료: 꼭짓점 {len(points)}개")
+                self._update_edit_state()
+            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
     def _on_apply_brush(self):
-        if not self._processor.has_image:
-            QMessageBox.warning(self, "경고", "이미지를 먼저 불러오세요.")
-            return
         mask = self._canvas_edit._brush_mask
         if mask is None or not (mask == 255).any():
             QMessageBox.warning(self, "경고", "먼저 지울 영역을 브러시로 칠하세요.")
             return
+        idx = self._get_active_overlay_idx()
         try:
-            img = self._processor.apply_brush_mask(mask)
-            self._canvas_edit.set_image(img)
-            self._status.set_message("브러시 마스크 적용 완료")
-            self._update_edit_state()
+            if idx >= 0:
+                overlays = self._canvas_edit.get_overlays()
+                if 0 <= idx < len(overlays):
+                    ov = overlays[idx]
+                    local_mask = self._translate_brush_mask_to_overlay(mask, ov)
+                    if self._apply_to_overlay(idx, lambda p: p.apply_brush_mask(local_mask)):
+                        self._status.set_message("레이어 브러시 마스크 적용 완료")
+            elif self._processor.has_image:
+                img = self._processor.apply_brush_mask(mask)
+                self._canvas_edit.set_image(img)
+                self._status.set_message("브러시 마스크 적용 완료")
+                self._update_edit_state()
+            else:
+                QMessageBox.warning(self, "경고", "편집할 레이어를 선택하세요.")
+        except Exception as e:
+            QMessageBox.critical(self, "오류", str(e))
+
+    # ------------------------------------------------------------------ #
+    #  색상 도구
+    # ------------------------------------------------------------------ #
+    def _on_color_sampled(self, r: int, g: int, b: int, a: int):
+        """스포이드: 캔버스에서 색 추출 → 현재 색상 업데이트"""
+        self._current_tool_color = (r, g, b, a)
+        self._toolbar.update_color_swatch(r, g, b, a)
+        self._canvas_edit.set_tool_color(r, g, b, a)
+        self._status.set_message(f"색상 추출: #{r:02x}{g:02x}{b:02x}  A={a}")
+
+    def _on_tool_color_changed(self, r: int, g: int, b: int, a: int):
+        """색상 피커에서 색 변경"""
+        self._current_tool_color = (r, g, b, a)
+        self._canvas_edit.set_tool_color(r, g, b, a)
+
+    def _on_fill_applied(self, x: int, y: int):
+        """채우기: 클릭 위치에 플러드 필 적용"""
+        idx = self._get_active_overlay_idx()
+        r, g, b, _ = self._current_tool_color
+        try:
+            if idx >= 0:
+                overlays = self._canvas_edit.get_overlays()
+                if 0 <= idx < len(overlays):
+                    ov = overlays[idx]
+                    xl, yl, _, _ = self._translate_to_overlay_coords(ov, x, y, 1, 1)
+                    color = self._current_tool_color
+                    if self._apply_to_overlay(idx, lambda p: p.fill_color(xl, yl, color)):
+                        self._status.set_message(f"레이어 채우기 완료: ({xl},{yl})  #{r:02x}{g:02x}{b:02x}")
+            elif self._processor.has_image:
+                img = self._processor.fill_color(x, y, self._current_tool_color)
+                self._canvas_edit.set_image(img)
+                self._status.set_message(f"채우기 완료: ({x},{y})  #{r:02x}{g:02x}{b:02x}")
+                self._update_edit_state()
+        except Exception as e:
+            QMessageBox.critical(self, "오류", str(e))
+
+    def _on_color_brush_done(self, mask):
+        """색상 브러시 획 완료: 마스크 저장"""
+        self._color_brush_pending_mask = mask
+
+    def _on_apply_color_brush(self):
+        """색상 브러시 적용 버튼"""
+        mask = self._color_brush_pending_mask
+        if mask is None or not (mask == 255).any():
+            QMessageBox.warning(self, "경고", "먼저 색상 브러시로 칠할 영역을 선택하세요.")
+            return
+        idx = self._get_active_overlay_idx()
+        try:
+            if idx >= 0:
+                overlays = self._canvas_edit.get_overlays()
+                if 0 <= idx < len(overlays):
+                    ov = overlays[idx]
+                    local_mask = self._translate_brush_mask_to_overlay(mask, ov)
+                    color = self._current_tool_color
+                    if self._apply_to_overlay(idx, lambda p: p.apply_color_brush(local_mask, color)):
+                        self._color_brush_pending_mask = None
+                        self._status.set_message("레이어 색상 브러시 적용 완료")
+            elif self._processor.has_image:
+                img = self._processor.apply_color_brush(mask, self._current_tool_color)
+                self._canvas_edit.set_image(img)
+                self._color_brush_pending_mask = None
+                self._status.set_message("색상 브러시 적용 완료")
+                self._update_edit_state()
+            else:
+                QMessageBox.warning(self, "경고", "편집할 레이어를 선택하세요.")
+        except Exception as e:
+            QMessageBox.critical(self, "오류", str(e))
+
+    def _on_clear_color_brush(self):
+        """색상 브러시 초기화"""
+        self._color_brush_pending_mask = None
+        self._canvas_edit._color_brush_mask = None
+        self._canvas_edit._color_brush_overlay = None
+        self._canvas_edit.update()
+        self._set_tool_mode("none")
+
+    # ------------------------------------------------------------------ #
+    #  도형 그리기 / AI 인페인팅
+    # ------------------------------------------------------------------ #
+    def _on_shape_committed(self, shape_type: str, x: int, y: int, w: int, h: int):
+        """캔버스에서 도형 드래그 완료 → 이미지에 점선 도형 그리기"""
+        if w < 2 or h < 2:
+            return
+        color = self._current_tool_color
+        line_width = self._toolbar.get_shape_line_width()
+        dash_len = self._toolbar.get_shape_dash_len()
+        kind = "ellipse" if shape_type == "shape_ellipse" else "rect"
+        r, g, b, _ = color
+        idx = self._get_active_overlay_idx()
+        try:
+            if idx >= 0:
+                overlays = self._canvas_edit.get_overlays()
+                if 0 <= idx < len(overlays):
+                    ov = overlays[idx]
+                    lx, ly, lw, lh = self._translate_to_overlay_coords(ov, x, y, w, h)
+                    if self._apply_to_overlay(idx, lambda p: p.draw_dotted_shape(kind, lx, ly, lw, lh, color, line_width, dash_len)):
+                        self._status.set_message(
+                            f"레이어 점선 {'원/타원' if kind == 'ellipse' else '사각형'} 완료: {lw}×{lh}  #{r:02x}{g:02x}{b:02x}"
+                        )
+            elif self._processor.has_image:
+                img = self._processor.draw_dotted_shape(kind, x, y, w, h, color, line_width, dash_len)
+                self._canvas_edit.set_image(img)
+                self._status.set_message(
+                    f"점선 {'원/타원' if kind == 'ellipse' else '사각형'} 그리기 완료: "
+                    f"({x},{y}) {w}×{h}  #{r:02x}{g:02x}{b:02x}"
+                )
+                self._update_edit_state()
+        except Exception as e:
+            QMessageBox.critical(self, "오류", str(e))
+
+    def _on_inpaint_committed(self, x: int, y: int, w: int, h: int):
+        """캔버스 드래그로 선택한 영역의 투명 픽셀을 AI(OpenCV 인페인팅)로 채우기"""
+        if w < 2 or h < 2:
+            return
+        self._status.set_message("빈 영역 AI 채우기 중...")
+        idx = self._get_active_overlay_idx()
+        try:
+            if idx >= 0:
+                overlays = self._canvas_edit.get_overlays()
+                if 0 <= idx < len(overlays):
+                    ov = overlays[idx]
+                    lx, ly, lw, lh = self._translate_to_overlay_coords(ov, x, y, w, h)
+                    if self._apply_to_overlay(idx, lambda p: p.inpaint_region(lx, ly, lw, lh)):
+                        self._status.set_message(f"레이어 빈 영역 채우기 완료: {lw}×{lh}")
+            elif self._processor.has_image:
+                img = self._processor.inpaint_region(x, y, w, h)
+                self._canvas_edit.set_image(img)
+                self._status.set_message(f"빈 영역 채우기 완료: ({x},{y}) {w}×{h}")
+                self._update_edit_state()
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -597,15 +1003,18 @@ class MainWindow(QMainWindow):
     #  크롭
     # ------------------------------------------------------------------ #
     def _on_crop_drag(self, x: int, y: int, w: int, h: int):
-        if not self._processor.has_image:
-            return
+        idx = self._get_active_overlay_idx()
         try:
-            img = self._processor.crop_by_rect(x, y, w, h)
-            self._canvas_edit.set_image(img)
-            nw, nh = self._processor.get_size()
-            self._status.set_size(nw, nh)
-            self._status.set_message(f"크롭 완료: {nw}×{nh}")
-            self._update_edit_state()
+            if idx >= 0:
+                self._crop_overlay(idx, x, y, w, h)
+            elif self._processor.has_image:
+                img = self._processor.crop_by_rect(x, y, w, h)
+                self._canvas_edit.set_image(img)
+                nw, nh = self._processor.get_size()
+                self._status.set_size(nw, nh)
+                self._workspace_size_lbl.setText(f"작업 크기: {nw} × {nh} px")
+                self._status.set_message(f"크롭 완료: {nw}×{nh}")
+                self._update_edit_state()
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -622,17 +1031,20 @@ class MainWindow(QMainWindow):
 
     def _on_crop_size_committed(self, x: int, y: int, w: int, h: int):
         """크기 지정 크롭 확정 적용"""
-        if not self._processor.has_image:
-            return
+        idx = self._get_active_overlay_idx()
         try:
-            img = self._processor.crop_by_rect(x, y, w, h)
-            self._canvas_edit.set_image(img)
+            if idx >= 0:
+                self._crop_overlay(idx, x, y, w, h)
+            elif self._processor.has_image:
+                img = self._processor.crop_by_rect(x, y, w, h)
+                self._canvas_edit.set_image(img)
+                nw, nh = self._processor.get_size()
+                self._status.set_size(nw, nh)
+                self._workspace_size_lbl.setText(f"작업 크기: {nw} × {nh} px")
+                self._status.set_message(f"크롭 완료: {nw}×{nh}")
+                self._update_edit_state()
             self._canvas_edit.set_mode("none")
             self._toolbar.set_mode("none")
-            nw, nh = self._processor.get_size()
-            self._status.set_size(nw, nh)
-            self._status.set_message(f"크롭 완료: {nw}×{nh}")
-            self._update_edit_state()
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -640,14 +1052,18 @@ class MainWindow(QMainWindow):
     #  필터
     # ------------------------------------------------------------------ #
     def _on_filter(self, name: str):
-        if not self._processor.has_image:
-            QMessageBox.warning(self, "경고", "이미지를 먼저 불러오세요.")
-            return
+        idx = self._get_active_overlay_idx()
         try:
-            img = self._processor.apply_filter(name)
-            self._canvas_edit.set_image(img)
-            self._status.set_message(f"필터 적용: {name}")
-            self._update_edit_state()
+            if idx >= 0:
+                if self._apply_to_overlay(idx, lambda p: p.apply_filter(name)):
+                    self._status.set_message(f"레이어 필터 적용: {name}")
+            elif self._processor.has_image:
+                img = self._processor.apply_filter(name)
+                self._canvas_edit.set_image(img)
+                self._status.set_message(f"필터 적용: {name}")
+                self._update_edit_state()
+            else:
+                QMessageBox.warning(self, "경고", "편집할 레이어를 선택하세요.")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -655,12 +1071,17 @@ class MainWindow(QMainWindow):
     #  초기화
     # ------------------------------------------------------------------ #
     def _on_reset(self):
+        idx = self._get_active_overlay_idx()
+        if idx >= 0:
+            self._status.set_message("레이어 복원은 레이어를 삭제 후 다시 추가하세요.")
+            return
         if not self._processor.has_image:
             return
         self._processor.reset_to_original()
         self._canvas_edit.set_image(self._processor.current_image)
         w, h = self._processor.get_size()
         self._status.set_size(w, h)
+        self._workspace_size_lbl.setText(f"작업 크기: {w} × {h} px")
         self._status.set_message("원본으로 복원했습니다.")
         self._update_edit_state()
 
@@ -672,6 +1093,7 @@ class MainWindow(QMainWindow):
             self._canvas_edit.set_image(self._processor.current_image)
             w, h = self._processor.get_size()
             self._status.set_size(w, h)
+            self._workspace_size_lbl.setText(f"작업 크기: {w} × {h} px")
 
     def _update_edit_state(self):
         self._toolbar.set_undo_enabled(self._processor.can_undo())

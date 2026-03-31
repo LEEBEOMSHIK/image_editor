@@ -90,6 +90,24 @@ class ImageProcessor:
         self._redo_stack.clear()
         return self._current
 
+    def new_blank(self, width: int, height: int,
+                  bg_color: tuple = (255, 255, 255, 255)) -> Image.Image:
+        """지정 크기의 새 빈 RGBA 이미지를 생성합니다."""
+        self._original = Image.new("RGBA", (width, height), bg_color)
+        self._current = self._original.copy()
+        self._history.clear()
+        self._redo_stack.clear()
+        return self._current
+
+    def load_pil(self, pil_img: Image.Image) -> Image.Image:
+        """PIL 이미지를 직접 로드합니다 (파일 경로 없이)."""
+        img = pil_img.convert("RGBA") if pil_img.mode != "RGBA" else pil_img.copy()
+        self._original = img.copy()
+        self._current = img.copy()
+        self._history.clear()
+        self._redo_stack.clear()
+        return self._current
+
     def save(self, path: str, fmt: str = "PNG"):
         if self._current is None:
             raise ValueError("저장할 이미지가 없습니다.")
@@ -180,6 +198,38 @@ class ImageProcessor:
         remove_mask = mask_array == 255
         arr[remove_mask, 3] = 0
         self._current = Image.fromarray(arr)
+        return self._current
+
+    def fill_color(self, x: int, y: int,
+                   fill_rgba: tuple, tolerance: int = 32) -> Image.Image:
+        """플러드 필 — 클릭 위치부터 유사한 색 영역을 fill_rgba 색으로 채운다."""
+        if self._current is None:
+            raise ValueError("이미지를 먼저 불러오세요.")
+        self._push_history()
+        from PIL import ImageDraw
+        img = self._current.convert("RGBA")
+        x = max(0, min(x, img.width - 1))
+        y = max(0, min(y, img.height - 1))
+        r, g, b, a = (fill_rgba + (255,))[:4]
+        ImageDraw.floodfill(img, (x, y), (r, g, b, a), thresh=tolerance)
+        self._current = img
+        return self._current
+
+    def apply_color_brush(self, mask: np.ndarray,
+                          fill_rgba: tuple) -> Image.Image:
+        """브러시로 칠한 영역(mask==255)에 fill_rgba 색상을 적용한다."""
+        if self._current is None:
+            raise ValueError("이미지를 먼저 불러오세요.")
+        self._push_history()
+        img = self._current.convert("RGBA")
+        arr = np.array(img)
+        r, g, b, a = (fill_rgba + (255,))[:4]
+        hit = mask == 255
+        arr[hit, 0] = r
+        arr[hit, 1] = g
+        arr[hit, 2] = b
+        arr[hit, 3] = a
+        self._current = Image.fromarray(arr, "RGBA")
         return self._current
 
     def merge_overlay(self, overlay_pil: Image.Image, x: int, y: int) -> Image.Image:
@@ -295,6 +345,138 @@ class ImageProcessor:
         else:
             raise ValueError(f"알 수 없는 필터: {filter_name}")
 
+        return self._current
+
+    # ------------------------------------------------------------------ #
+    #  도형 그리기
+    # ------------------------------------------------------------------ #
+    def draw_dotted_shape(self, shape: str, x: int, y: int, w: int, h: int,
+                          color: tuple = (255, 0, 0, 255),
+                          line_width: int = 2, dash_len: int = 12) -> Image.Image:
+        """
+        점선 도형을 현재 이미지에 그린다.
+        shape: 'rect' (사각형) 또는 'ellipse' (원/타원)
+        color: (r, g, b) 또는 (r, g, b, a)
+        """
+        import math
+        from PIL import ImageDraw
+        if self._current is None:
+            raise ValueError("이미지를 먼저 불러오세요.")
+        self._push_history()
+        img = self._current.convert("RGBA")
+        draw = ImageDraw.Draw(img)
+        c = tuple((list(color) + [255])[:4])
+
+        if shape == 'rect':
+            x1, y1, x2, y2 = x, y, x + w, y + h
+            # 상변·하변 (수평 점선)
+            for fy in (y1, y2):
+                cx = x1
+                on = True
+                while cx < x2:
+                    ex = min(cx + dash_len, x2)
+                    if on:
+                        draw.line([(cx, fy), (ex, fy)], fill=c, width=line_width)
+                    cx = ex
+                    on = not on
+            # 좌변·우변 (수직 점선)
+            for fx in (x1, x2):
+                cy = y1
+                on = True
+                while cy < y2:
+                    ey = min(cy + dash_len, y2)
+                    if on:
+                        draw.line([(fx, cy), (fx, ey)], fill=c, width=line_width)
+                    cy = ey
+                    on = not on
+
+        elif shape == 'ellipse':
+            cx_f = x + w / 2
+            cy_f = y + h / 2
+            rx = w / 2
+            ry = h / 2
+            # 둘레 근사 (Ramanujan 공식)
+            perimeter = math.pi * (3 * (rx + ry) -
+                                   math.sqrt((3 * rx + ry) * (rx + 3 * ry)))
+            steps = max(120, int(perimeter * 1.5))
+            pts = [(cx_f + rx * math.cos(2 * math.pi * i / steps),
+                    cy_f + ry * math.sin(2 * math.pi * i / steps))
+                   for i in range(steps + 1)]
+            seg_len = 0.0
+            on = True
+            for i in range(1, len(pts)):
+                p0, p1 = pts[i - 1], pts[i]
+                dist = math.dist(p0, p1)
+                if on:
+                    draw.line([p0, p1], fill=c, width=line_width)
+                seg_len += dist
+                if seg_len >= dash_len:
+                    on = not on
+                    seg_len = 0.0
+
+        self._current = img
+        return self._current
+
+    # ------------------------------------------------------------------ #
+    #  AI 인페인팅 (빈 영역 채우기)
+    # ------------------------------------------------------------------ #
+    def inpaint_region(self, x: int, y: int, w: int, h: int,
+                       radius: int = 5) -> Image.Image:
+        """지정한 직사각형 영역의 투명 픽셀만 OpenCV Telea 인페인팅으로 채운다."""
+        if self._current is None:
+            raise ValueError("이미지를 먼저 불러오세요.")
+        img_rgba = self._current.convert("RGBA")
+        arr = np.array(img_rgba)
+        ih, iw = arr.shape[:2]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(iw, x + w), min(ih, y + h)
+        if x2 <= x1 or y2 <= y1:
+            return self._current
+        region = arr[y1:y2, x1:x2]
+        mask_region = np.where(region[:, :, 3] < 128, 255, 0).astype(np.uint8)
+        if mask_region.max() == 0:
+            return self._current  # 해당 영역에 투명 픽셀 없음
+        self._push_history()
+        bgr_region = cv2.cvtColor(region[:, :, :3], cv2.COLOR_RGB2BGR)
+        inpainted = cv2.inpaint(bgr_region, mask_region, radius, cv2.INPAINT_TELEA)
+        result_rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+        result_arr = arr.copy()
+        transparent = mask_region > 0
+        result_arr[y1:y2, x1:x2][transparent, :3] = result_rgb[transparent]
+        result_arr[y1:y2, x1:x2][transparent, 3] = 255
+        self._current = Image.fromarray(result_arr, "RGBA")
+        return self._current
+
+    def inpaint_transparent(self, radius: int = 5) -> Image.Image:
+        """
+        투명(알파=0) 픽셀을 OpenCV Telea 인페인팅으로 주변 색을 채운다.
+        반투명 픽셀(0 < alpha < 255)도 마스크에 포함하여 자연스럽게 블렌딩한다.
+        """
+        if self._current is None:
+            raise ValueError("이미지를 먼저 불러오세요.")
+
+        img_rgba = self._current.convert("RGBA")
+        arr = np.array(img_rgba)
+        alpha = arr[:, :, 3]
+
+        # 알파가 128 미만인 픽셀을 인페인팅 대상으로
+        mask = np.where(alpha < 128, 255, 0).astype(np.uint8)
+        if mask.max() == 0:
+            return self._current  # 투명 픽셀 없음 — 변경 없음
+
+        self._push_history()
+
+        bgr = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
+        inpainted = cv2.inpaint(bgr, mask, radius, cv2.INPAINT_TELEA)
+        result_rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+
+        result_arr = arr.copy()
+        # 인페인팅된 색상을 투명 영역에 채우고 알파=255로 복원
+        transparent = mask > 0
+        result_arr[transparent, :3] = result_rgb[transparent]
+        result_arr[transparent, 3] = 255
+
+        self._current = Image.fromarray(result_arr, "RGBA")
         return self._current
 
     # ------------------------------------------------------------------ #

@@ -2,6 +2,7 @@
 ui/canvas.py
 이미지 표시 및 마우스 인터랙션 캔버스
 """
+import os
 import numpy as np
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal
@@ -9,6 +10,12 @@ from PyQt6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QCursor, QBrush, QPolygon
 )
 from PIL import Image
+
+# 작업 영역 배경 타일 이미지 (투명도 표시용)
+_BG_TILE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'images', 'img_2.png'
+)
 
 
 class ImageCanvas(QLabel):
@@ -32,13 +39,25 @@ class ImageCanvas(QLabel):
     overlay_selected    = pyqtSignal(int)                  # 선택된 오버레이 인덱스 (-1=없음)
     overlay_moved       = pyqtSignal(int, int, int)        # index, x, y (이미지 좌표)
     overlays_changed    = pyqtSignal()                     # 추가/삭제 등 목록 변경
+    # 색상 도구
+    color_sampled       = pyqtSignal(int, int, int, int)  # r, g, b, a (스포이드)
+    fill_applied        = pyqtSignal(int, int)             # x, y (이미지 좌표)
+    color_brush_done    = pyqtSignal(object)               # mask array
+    shape_committed     = pyqtSignal(str, int, int, int, int)  # shape_type, x, y, w, h (이미지 좌표)
+    inpaint_committed   = pyqtSignal(int, int, int, int)       # x, y, w, h (이미지 좌표)
 
-    MODE_NONE       = "none"
-    MODE_CROP       = "crop"
-    MODE_GRABCUT    = "grabcut"
-    MODE_BRUSH      = "brush"
-    MODE_POLYGON    = "polygon"
-    MODE_CROP_SIZE  = "crop_size"   # 크기 지정 크롭 미리보기
+    MODE_NONE         = "none"
+    MODE_CROP         = "crop"
+    MODE_GRABCUT      = "grabcut"
+    MODE_BRUSH        = "brush"
+    MODE_POLYGON      = "polygon"
+    MODE_CROP_SIZE    = "crop_size"   # 크기 지정 크롭 미리보기
+    MODE_PIPETTE      = "pipette"     # 스포이드 (색 추출)
+    MODE_FILL         = "fill"        # 채우기 (플러드 필)
+    MODE_COLOR_BRUSH   = "color_brush"   # 색상 브러시
+    MODE_SHAPE_RECT    = "shape_rect"    # 점선 사각형 그리기
+    MODE_SHAPE_ELLIPSE = "shape_ellipse" # 점선 원/타원 그리기
+    MODE_INPAINT       = "inpaint"       # AI 빈 영역 채우기 영역 드래그
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -68,6 +87,20 @@ class ImageCanvas(QLabel):
         self._brush_mask: np.ndarray | None = None
         self._brush_overlay: QPixmap | None = None
         self._drawing = False
+
+        # 색상 도구
+        self._tool_color: tuple = (0, 0, 0, 255)              # 현재 선택 색 (RGBA)
+        self._color_brush_mask: np.ndarray | None = None      # 색상 브러시 마스크
+        self._color_brush_overlay: QPixmap | None = None      # 색상 브러시 미리보기
+        self._color_drawing = False
+
+        # 도형 그리기
+        self._shape_drag_start: QPoint | None = None
+        self._shape_rect: QRect | None = None
+
+        # 인페인팅 영역 드래그
+        self._inpaint_drag_start: QPoint | None = None
+        self._inpaint_rect: QRect | None = None
 
         # 다각형
         self._poly_image_pts: list[tuple[int, int]] = []
@@ -105,6 +138,17 @@ class ImageCanvas(QLabel):
         # 드래그 앤 드롭 활성화
         self.setAcceptDrops(True)
 
+        # 작업 영역 배경 타일 픽스맵
+        self._bg_tile_pixmap: QPixmap | None = None
+        try:
+            tile_img = Image.open(_BG_TILE_PATH).convert("RGBA")
+            tile_data = tile_img.tobytes("raw", "RGBA")
+            tile_qimg = QImage(tile_data, tile_img.width, tile_img.height,
+                               QImage.Format.Format_RGBA8888)
+            self._bg_tile_pixmap = QPixmap.fromImage(tile_qimg)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ #
     #  공개 메서드
     # ------------------------------------------------------------------ #
@@ -112,6 +156,8 @@ class ImageCanvas(QLabel):
         self._pil_image = pil_img
         self._refresh_pixmap()
         self._init_brush_mask()
+        self._color_brush_overlay = None
+        self._color_brush_mask = None
 
     def set_original_image(self, pil_img: Image.Image):
         """원본 이미지를 우상단 미리보기용으로 저장"""
@@ -131,18 +177,35 @@ class ImageCanvas(QLabel):
             self.cancel_polygon()
         if mode != self.MODE_CROP_SIZE:
             self._crop_preview_rect = None
+        if mode not in (self.MODE_SHAPE_RECT, self.MODE_SHAPE_ELLIPSE):
+            self._shape_rect = None
+            self._shape_drag_start = None
+        if mode != self.MODE_INPAINT:
+            self._inpaint_rect = None
+            self._inpaint_drag_start = None
         cursors = {
-            self.MODE_BRUSH:     Qt.CursorShape.CrossCursor,
-            self.MODE_CROP:      Qt.CursorShape.CrossCursor,
-            self.MODE_GRABCUT:   Qt.CursorShape.CrossCursor,
-            self.MODE_POLYGON:   Qt.CursorShape.CrossCursor,
-            self.MODE_CROP_SIZE: Qt.CursorShape.SizeAllCursor,
+            self.MODE_BRUSH:         Qt.CursorShape.CrossCursor,
+            self.MODE_CROP:          Qt.CursorShape.CrossCursor,
+            self.MODE_GRABCUT:       Qt.CursorShape.CrossCursor,
+            self.MODE_POLYGON:       Qt.CursorShape.CrossCursor,
+            self.MODE_CROP_SIZE:     Qt.CursorShape.SizeAllCursor,
+            self.MODE_PIPETTE:       Qt.CursorShape.CrossCursor,
+            self.MODE_FILL:          Qt.CursorShape.CrossCursor,
+            self.MODE_COLOR_BRUSH:   Qt.CursorShape.CrossCursor,
+            self.MODE_SHAPE_RECT:    Qt.CursorShape.CrossCursor,
+            self.MODE_SHAPE_ELLIPSE: Qt.CursorShape.CrossCursor,
+            self.MODE_INPAINT:       Qt.CursorShape.CrossCursor,
         }
         self.setCursor(QCursor(cursors.get(mode, Qt.CursorShape.ArrowCursor)))
         self.update()
 
     def set_brush_size(self, size: int):
         self._brush_size = size
+
+    def set_tool_color(self, r: int, g: int, b: int, a: int = 255):
+        """색상 도구에서 사용할 현재 색상 설정"""
+        self._tool_color = (r, g, b, a)
+        self._color_brush_overlay = None   # 미리보기 색 재생성
 
     def clear_brush_overlay(self):
         self._brush_overlay = None
@@ -229,6 +292,38 @@ class ImageCanvas(QLabel):
         self._active_overlay = -1
         self.overlays_changed.emit()
         self.update()
+
+    def reset_overlay_size(self, index: int):
+        """오버레이를 원본 크기로 초기화"""
+        if 0 <= index < len(self._overlays):
+            ov = self._overlays[index]
+            ov['disp_w'] = ov['pil'].width
+            ov['disp_h'] = ov['pil'].height
+            self.update()
+
+    def fit_overlay_to_canvas(self, index: int):
+        """선택한 오버레이를 작업 크기(캔버스)에 꽉 차게 확대"""
+        if 0 <= index < len(self._overlays) and self._pil_image:
+            cw, ch = self._pil_image.size
+            self._overlays[index]['disp_w'] = cw
+            self._overlays[index]['disp_h'] = ch
+            self._overlays[index]['x'] = 0
+            self._overlays[index]['y'] = 0
+            self.update()
+
+    def update_overlay_image(self, index: int, new_pil: Image.Image):
+        """오버레이의 PIL 이미지와 픽스맵을 갱신합니다."""
+        if 0 <= index < len(self._overlays):
+            ov = self._overlays[index]
+            pil = new_pil.convert("RGBA") if new_pil.mode != "RGBA" else new_pil.copy()
+            ov['pil'] = pil
+            data = pil.tobytes("raw", "RGBA")
+            qimg = QImage(data, pil.width, pil.height, QImage.Format.Format_RGBA8888)
+            ov['pixmap'] = QPixmap.fromImage(qimg)
+            ov['disp_w'] = pil.width
+            ov['disp_h'] = pil.height
+            self.overlays_changed.emit()
+            self.update()
 
     def reset_zoom(self):
         self._zoom = 1.0
@@ -347,26 +442,37 @@ class ImageCanvas(QLabel):
 
         if self._pixmap:
             rect = self.get_image_rect()
+            # img_2.png 타일 패턴을 작업 영역 배경으로 렌더링
+            if self._bg_tile_pixmap:
+                painter.save()
+                painter.setClipRect(rect)
+                tw = self._bg_tile_pixmap.width()
+                th = self._bg_tile_pixmap.height()
+                col = 0
+                while col * tw < rect.width() + tw:
+                    row = 0
+                    while row * th < rect.height() + th:
+                        painter.drawPixmap(
+                            rect.x() + col * tw,
+                            rect.y() + row * th,
+                            self._bg_tile_pixmap,
+                        )
+                        row += 1
+                    col += 1
+                painter.restore()
+
             if self._base_visible:
                 painter.drawPixmap(rect, self._pixmap)
-            else:
-                # 기본 이미지 숨김: 체스판 패턴으로 투명 영역 표시
-                checker_size = 12
-                c1, c2 = QColor(0x3a, 0x3a, 0x4e), QColor(0x2a, 0x2a, 0x3e)
-                for row in range((rect.height() // checker_size) + 1):
-                    for col in range((rect.width() // checker_size) + 1):
-                        color = c1 if (row + col) % 2 == 0 else c2
-                        painter.fillRect(
-                            rect.x() + col * checker_size,
-                            rect.y() + row * checker_size,
-                            min(checker_size, rect.right() - (rect.x() + col * checker_size)),
-                            min(checker_size, rect.bottom() - (rect.y() + row * checker_size)),
-                            color,
-                        )
+            # 기본 이미지 숨김 시 타일 패턴만 표시 (별도 렌더링 불필요)
 
             if self._brush_overlay:
                 painter.setOpacity(0.5)
                 painter.drawPixmap(rect, self._brush_overlay)
+                painter.setOpacity(1.0)
+
+            if self._color_brush_overlay:
+                painter.setOpacity(0.75)
+                painter.drawPixmap(rect, self._color_brush_overlay)
                 painter.setOpacity(1.0)
 
             # 오버레이 이미지 렌더링
@@ -560,6 +666,40 @@ class ImageCanvas(QLabel):
                 painter.drawText(widget_pts[0].x() + 10, widget_pts[0].y() - 6,
                                  "클릭으로 꼭짓점 추가  |  더블클릭으로 완성")
 
+        # ── 인페인팅 영역 미리보기 (청록색) ─────────────────────────────
+        if self._inpaint_rect and self._mode == self.MODE_INPAINT:
+            fill   = QColor(50, 220, 180, 55)
+            border = QColor(50, 220, 180, 230)
+            painter.fillRect(self._inpaint_rect, fill)
+            pen = QPen(border, 2, Qt.PenStyle.DashLine)
+            pen.setDashPattern([8, 4])
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self._inpaint_rect)
+            painter.setPen(border)
+            f = painter.font(); f.setBold(True); f.setPointSize(9); painter.setFont(f)
+            painter.drawText(self._inpaint_rect.x() + 5, self._inpaint_rect.y() - 6,
+                             "✨ AI 채우기 영역")
+
+        # ── 도형 그리기 미리보기 ─────────────────────────────────────────
+        if self._shape_rect and self._mode in (self.MODE_SHAPE_RECT, self.MODE_SHAPE_ELLIPSE):
+            pen = QPen(QColor(200, 100, 250), 2, Qt.PenStyle.DashLine)
+            pen.setDashPattern([6, 4])
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if self._mode == self.MODE_SHAPE_RECT:
+                painter.drawRect(self._shape_rect)
+                label = "□ 사각형 점선"
+            else:
+                painter.drawEllipse(self._shape_rect)
+                label = "○ 원/타원 점선"
+            painter.setPen(QColor(200, 100, 250))
+            f = painter.font()
+            f.setBold(True)
+            f.setPointSize(9)
+            painter.setFont(f)
+            painter.drawText(self._shape_rect.x() + 5, self._shape_rect.y() - 6, label)
+
     # ------------------------------------------------------------------ #
     #  이벤트
     # ------------------------------------------------------------------ #
@@ -679,12 +819,45 @@ class ImageCanvas(QLabel):
                 self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
             return
 
+        # 스포이드 — 픽셀 색상 추출
+        if self._mode == self.MODE_PIPETTE:
+            if self._pil_image:
+                img_pt = self._widget_to_image(pos)
+                pixel = self._pil_image.convert("RGBA").getpixel(
+                    (img_pt.x(), img_pt.y()))
+                self.color_sampled.emit(*pixel)
+            return
+
+        # 채우기
+        if self._mode == self.MODE_FILL:
+            if self._pil_image:
+                img_pt = self._widget_to_image(pos)
+                self.fill_applied.emit(img_pt.x(), img_pt.y())
+            return
+
+        # 도형 그리기 모드
+        if self._mode in (self.MODE_SHAPE_RECT, self.MODE_SHAPE_ELLIPSE):
+            self._shape_drag_start = pos
+            self._shape_rect = None
+            return
+
+        # 인페인팅 드래그 모드
+        if self._mode == self.MODE_INPAINT:
+            self._inpaint_drag_start = pos
+            self._inpaint_rect = None
+            return
+
         self._drag_start = pos
         self._selection_rect = None
 
         if self._mode == self.MODE_BRUSH:
             self._drawing = True
             self._draw_brush(pos)
+        elif self._mode == self.MODE_COLOR_BRUSH:
+            if self._color_brush_mask is None:
+                self._init_color_brush_mask()
+            self._color_drawing = True
+            self._draw_color_brush(pos)
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
@@ -783,6 +956,14 @@ class ImageCanvas(QLabel):
             self.update()
         elif self._mode == self.MODE_BRUSH and self._drawing:
             self._draw_brush(pos)
+        elif self._mode == self.MODE_COLOR_BRUSH and self._color_drawing:
+            self._draw_color_brush(pos)
+        elif self._mode in (self.MODE_SHAPE_RECT, self.MODE_SHAPE_ELLIPSE) and self._shape_drag_start:
+            self._shape_rect = QRect(self._shape_drag_start, pos).normalized()
+            self.update()
+        elif self._mode == self.MODE_INPAINT and self._inpaint_drag_start:
+            self._inpaint_rect = QRect(self._inpaint_drag_start, pos).normalized()
+            self.update()
 
         # 호버 상태 업데이트 (미니맵 + 오버레이 커서)
         self._update_hover_state(pos)
@@ -801,11 +982,17 @@ class ImageCanvas(QLabel):
             self._left_pan_start = None
             self._left_pan_start_offset = None
             cursors = {
-                self.MODE_BRUSH: Qt.CursorShape.CrossCursor,
-                self.MODE_CROP: Qt.CursorShape.CrossCursor,
-                self.MODE_GRABCUT: Qt.CursorShape.CrossCursor,
-                self.MODE_POLYGON: Qt.CursorShape.CrossCursor,
-                self.MODE_CROP_SIZE: Qt.CursorShape.SizeAllCursor,
+                self.MODE_BRUSH:         Qt.CursorShape.CrossCursor,
+                self.MODE_CROP:          Qt.CursorShape.CrossCursor,
+                self.MODE_GRABCUT:       Qt.CursorShape.CrossCursor,
+                self.MODE_POLYGON:       Qt.CursorShape.CrossCursor,
+                self.MODE_CROP_SIZE:     Qt.CursorShape.SizeAllCursor,
+                self.MODE_PIPETTE:       Qt.CursorShape.CrossCursor,
+                self.MODE_FILL:          Qt.CursorShape.CrossCursor,
+                self.MODE_COLOR_BRUSH:   Qt.CursorShape.CrossCursor,
+                self.MODE_SHAPE_RECT:    Qt.CursorShape.CrossCursor,
+                self.MODE_SHAPE_ELLIPSE: Qt.CursorShape.CrossCursor,
+                self.MODE_INPAINT:       Qt.CursorShape.CrossCursor,
             }
             self.setCursor(QCursor(cursors.get(self._mode, Qt.CursorShape.ArrowCursor)))
 
@@ -863,6 +1050,31 @@ class ImageCanvas(QLabel):
             self._drawing = False
             if self._brush_mask is not None:
                 self.brush_stroke_done.emit(self._brush_mask.copy())
+
+        elif self._mode == self.MODE_COLOR_BRUSH:
+            self._color_drawing = False
+            if (self._color_brush_mask is not None
+                    and (self._color_brush_mask == 255).any()):
+                self.color_brush_done.emit(self._color_brush_mask.copy())
+                # 스트로크 커밋 후 마스크/오버레이 초기화 (다음 스트로크 준비)
+                self._color_brush_mask = None
+                self._color_brush_overlay = None
+
+        elif self._mode in (self.MODE_SHAPE_RECT, self.MODE_SHAPE_ELLIPSE):
+            if self._shape_drag_start and self._shape_rect:
+                rect = QRect(self._shape_drag_start, pos).normalized()
+                self._shape_rect = None
+                self.update()
+                self._emit_shape_signal(rect)
+            self._shape_drag_start = None
+
+        elif self._mode == self.MODE_INPAINT:
+            if self._inpaint_drag_start and self._inpaint_rect:
+                rect = QRect(self._inpaint_drag_start, pos).normalized()
+                self._inpaint_rect = None
+                self.update()
+                self._emit_inpaint_signal(rect)
+            self._inpaint_drag_start = None
 
         self._drag_start = None
 
@@ -1033,6 +1245,28 @@ class ImageCanvas(QLabel):
         if w > 0 and h > 0:
             signal.emit(x, y, w, h)
 
+    def _emit_shape_signal(self, widget_rect: QRect):
+        """위젯 좌표 rect → 이미지 좌표로 변환 후 shape_committed 발생"""
+        if self._pil_image is None:
+            return
+        img_tl = self._widget_to_image(widget_rect.topLeft())
+        img_br = self._widget_to_image(widget_rect.bottomRight())
+        x, y = img_tl.x(), img_tl.y()
+        w = max(1, img_br.x() - x)
+        h = max(1, img_br.y() - y)
+        self.shape_committed.emit(self._mode, x, y, w, h)
+
+    def _emit_inpaint_signal(self, widget_rect: QRect):
+        """위젯 좌표 rect → 이미지 좌표로 변환 후 inpaint_committed 발생"""
+        if self._pil_image is None:
+            return
+        img_tl = self._widget_to_image(widget_rect.topLeft())
+        img_br = self._widget_to_image(widget_rect.bottomRight())
+        x, y = img_tl.x(), img_tl.y()
+        w = max(1, img_br.x() - x)
+        h = max(1, img_br.y() - y)
+        self.inpaint_committed.emit(x, y, w, h)
+
     def _draw_brush(self, widget_pos: QPoint):
         if self._pil_image is None or self._brush_mask is None:
             return
@@ -1059,3 +1293,39 @@ class ImageCanvas(QLabel):
         painter.end()
 
         self.update()
+
+    def _init_color_brush_mask(self):
+        if self._pil_image is None:
+            return
+        w, h = self._pil_image.size
+        self._color_brush_mask = np.zeros((h, w), dtype=np.uint8)
+
+    def _draw_color_brush(self, widget_pos: QPoint):
+        """색상 브러시 스트로크 — 마스크 업데이트 및 미리보기 렌더링"""
+        if self._pil_image is None or self._color_brush_mask is None or self._pixmap is None:
+            return
+        img_pt = self._widget_to_image(widget_pos)
+        ix, iy = img_pt.x(), img_pt.y()
+
+        h, w = self._color_brush_mask.shape
+        half = self._brush_size // 2
+        y1, y2 = max(0, iy - half), min(h, iy + half)
+        x1, x2 = max(0, ix - half), min(w, ix + half)
+        self._color_brush_mask[y1:y2, x1:x2] = 255
+
+        r, g, b, a = self._tool_color
+        if self._color_brush_overlay is None:
+            self._color_brush_overlay = QPixmap(self._pixmap.size())
+            self._color_brush_overlay.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(self._color_brush_overlay)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(r, g, b, min(a, 200)))
+        scaled_half = int(half * self._scale)
+        sx = int(ix * self._scale) - scaled_half
+        sy = int(iy * self._scale) - scaled_half
+        painter.drawEllipse(sx, sy, scaled_half * 2, scaled_half * 2)
+        painter.end()
+
+        self.update()
+

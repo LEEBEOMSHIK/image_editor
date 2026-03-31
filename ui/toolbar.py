@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QSlider, QSpinBox, QHBoxLayout, QComboBox, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 
 
 class ToolButton(QPushButton):
@@ -91,6 +92,10 @@ class Toolbar(QWidget):
     sig_zoom_in  = pyqtSignal()
     sig_zoom_out = pyqtSignal()
 
+    sig_color_changed      = pyqtSignal(int, int, int, int)  # r, g, b, a (색상 변경)
+    sig_apply_color_brush  = pyqtSignal()
+    sig_clear_color_brush  = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(210)
@@ -121,6 +126,7 @@ class Toolbar(QWidget):
         layout = QVBoxLayout(parent)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(4)
+        self._current_color: tuple = (0, 0, 0, 255)   # (r, g, b, a)
 
         # ── 파일 ──────────────────────────────────────────
         layout.addWidget(SectionLabel("📁  파일"))
@@ -207,6 +213,107 @@ class Toolbar(QWidget):
         btn_row2.addWidget(btn_apply_brush)
         btn_row2.addWidget(btn_clear_brush)
         layout.addLayout(btn_row2)
+
+        layout.addWidget(self._separator())
+
+        # ── 색상 도구 ──────────────────────────────────────
+        layout.addWidget(SectionLabel("🎨  색상 도구"))
+
+        # 현재 색상 스와치 (클릭하면 색상 선택 다이얼로그)
+        self._color_swatch = QPushButton()
+        self._color_swatch.setMinimumHeight(32)
+        self._color_swatch.setToolTip("현재 선택 색상\n클릭하면 색상 직접 선택")
+        self._color_swatch.clicked.connect(self._on_pick_color)
+        self._refresh_color_swatch()
+        layout.addWidget(self._color_swatch)
+
+        self.btn_pipette = ToolButton("💉 스포이드  (색 추출)")
+        self.btn_pipette.setToolTip(
+            "스포이드 모드\n이미지의 픽셀을 클릭하면 해당 색을 현재 색상으로 지정합니다."
+        )
+        self.btn_pipette.clicked.connect(self._on_pipette_toggle)
+        layout.addWidget(self.btn_pipette)
+
+        self.btn_fill = ToolButton("🪣 채우기")
+        self.btn_fill.setToolTip(
+            "채우기 모드\n클릭한 위치부터 유사한 색 영역을 현재 색상으로 채웁니다."
+        )
+        self.btn_fill.clicked.connect(self._on_fill_toggle)
+        layout.addWidget(self.btn_fill)
+
+        self.btn_color_brush = ToolButton("🖌 색상 브러시")
+        self.btn_color_brush.setToolTip(
+            "색상 브러시 모드\n마우스로 칠한 영역에 현재 색상을 적용합니다.\n"
+            "칠한 후 '색상 브러시 적용' 클릭"
+        )
+        self.btn_color_brush.clicked.connect(self._on_color_brush_toggle)
+        layout.addWidget(self.btn_color_brush)
+
+        color_btn_row = QHBoxLayout()
+        btn_apply_color_brush = ActionButton("브러시 적용")
+        btn_apply_color_brush.setToolTip("색상 브러시로 칠한 영역에 색상 적용")
+        btn_apply_color_brush.clicked.connect(self.sig_apply_color_brush)
+        btn_clear_color_brush = ActionButton("초기화", "#fab387")
+        btn_clear_color_brush.setToolTip("색상 브러시 영역 초기화")
+        btn_clear_color_brush.clicked.connect(self._on_clear_color_brush)
+        color_btn_row.addWidget(btn_apply_color_brush)
+        color_btn_row.addWidget(btn_clear_color_brush)
+        layout.addLayout(color_btn_row)
+
+        layout.addWidget(self._separator())
+
+        # ── 도형 그리기 ──────────────────────────────────────
+        layout.addWidget(SectionLabel("✏  도형 그리기"))
+
+        self.btn_shape_rect = ToolButton("□ 사각형 점선")
+        self.btn_shape_rect.setToolTip(
+            "점선 사각형 모드\n"
+            "드래그로 사각형 영역을 지정하면\n현재 색상으로 점선 테두리를 그립니다."
+        )
+        self.btn_shape_rect.clicked.connect(self._on_shape_rect_toggle)
+        layout.addWidget(self.btn_shape_rect)
+
+        self.btn_shape_ellipse = ToolButton("○ 원 / 타원 점선")
+        self.btn_shape_ellipse.setToolTip(
+            "점선 원/타원 모드\n"
+            "드래그로 타원 영역을 지정하면\n현재 색상으로 점선 테두리를 그립니다."
+        )
+        self.btn_shape_ellipse.clicked.connect(self._on_shape_ellipse_toggle)
+        layout.addWidget(self.btn_shape_ellipse)
+
+        shape_width_row = QHBoxLayout()
+        shape_width_row.addWidget(QLabel("두께:"))
+        self._spin_shape_width = QSpinBox()
+        self._spin_shape_width.setRange(1, 20)
+        self._spin_shape_width.setValue(2)
+        self._spin_shape_width.setToolTip("점선 두께 (픽셀)")
+        self._spin_shape_width.setStyleSheet(
+            "background:#313244; color:#cdd6f4; border:1px solid #45475a; border-radius:4px;"
+        )
+        shape_width_row.addWidget(self._spin_shape_width)
+        shape_width_row.addWidget(QLabel("간격:"))
+        self._spin_shape_dash = QSpinBox()
+        self._spin_shape_dash.setRange(2, 50)
+        self._spin_shape_dash.setValue(12)
+        self._spin_shape_dash.setToolTip("점선 대시 길이 (픽셀)")
+        self._spin_shape_dash.setStyleSheet(
+            "background:#313244; color:#cdd6f4; border:1px solid #45475a; border-radius:4px;"
+        )
+        shape_width_row.addWidget(self._spin_shape_dash)
+        layout.addLayout(shape_width_row)
+
+        layout.addWidget(self._separator())
+
+        # ── AI 인페인팅 ──────────────────────────────────────
+        layout.addWidget(SectionLabel("✨  빈 영역 채우기"))
+        self.btn_inpaint = ToolButton("✨ AI 빈 영역 채우기")
+        self.btn_inpaint.setToolTip(
+            "AI 채우기 모드\n"
+            "드래그로 채울 영역을 선택하면\n"
+            "투명(빈) 픽셀을 주변 색으로 자연스럽게 채웁니다."
+        )
+        self.btn_inpaint.clicked.connect(self._on_inpaint_toggle)
+        layout.addWidget(self.btn_inpaint)
 
         layout.addWidget(self._separator())
 
@@ -322,7 +429,9 @@ class Toolbar(QWidget):
     #  토글 핸들러
     # ------------------------------------------------------------------ #
     def _all_mode_buttons(self):
-        return [self.btn_move, self.btn_grabcut, self.btn_brush, self.btn_crop_drag, self.btn_polygon]
+        return [self.btn_move, self.btn_grabcut, self.btn_brush, self.btn_crop_drag, self.btn_polygon,
+                self.btn_pipette, self.btn_fill, self.btn_color_brush,
+                self.btn_shape_rect, self.btn_shape_ellipse, self.btn_inpaint]
 
     def _clear_mode_buttons(self):
         for btn in self._all_mode_buttons():
@@ -358,6 +467,78 @@ class Toolbar(QWidget):
         self.sig_mode_changed.emit("none")
         self.sig_clear_brush.emit()
 
+    def _on_pipette_toggle(self):
+        self._clear_mode_buttons()
+        self.btn_pipette.setChecked(True)
+        self.sig_mode_changed.emit("pipette")
+
+    def _on_fill_toggle(self):
+        self._clear_mode_buttons()
+        self.btn_fill.setChecked(True)
+        self.sig_mode_changed.emit("fill")
+
+    def _on_color_brush_toggle(self):
+        self._clear_mode_buttons()
+        self.btn_color_brush.setChecked(True)
+        self.sig_mode_changed.emit("color_brush")
+
+    def _on_clear_color_brush(self):
+        self._clear_mode_buttons()
+        self.sig_mode_changed.emit("none")
+        self.sig_clear_color_brush.emit()
+
+    def _on_shape_rect_toggle(self):
+        self._clear_mode_buttons()
+        self.btn_shape_rect.setChecked(True)
+        self.sig_mode_changed.emit("shape_rect")
+
+    def _on_shape_ellipse_toggle(self):
+        self._clear_mode_buttons()
+        self.btn_shape_ellipse.setChecked(True)
+        self.sig_mode_changed.emit("shape_ellipse")
+
+    def _on_inpaint_toggle(self):
+        self._clear_mode_buttons()
+        self.btn_inpaint.setChecked(True)
+        self.sig_mode_changed.emit("inpaint")
+
+    def _on_pick_color(self):
+        """색상 선택 다이얼로그 열기"""
+        from PyQt6.QtWidgets import QColorDialog
+        r, g, b, a = self._current_color
+        color = QColorDialog.getColor(QColor(r, g, b), self, "색상 선택")
+        if color.isValid():
+            self._current_color = (color.red(), color.green(), color.blue(), 255)
+            self._refresh_color_swatch()
+            self.sig_color_changed.emit(*self._current_color)
+
+    def _refresh_color_swatch(self):
+        """색상 스와치 버튼 스타일 갱신"""
+        r, g, b, a = self._current_color
+        hex_str = f"#{r:02x}{g:02x}{b:02x}"
+        text_color = "#000000" if (r + g + b) > 384 else "#ffffff"
+        self._color_swatch.setText(f"  {hex_str}  (클릭 → 색상 선택)")
+        self._color_swatch.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {hex_str};
+                color: {text_color};
+                border: 1px solid #45475a;
+                border-radius: 6px;
+                padding: 6px;
+                font-size: 11px;
+                text-align: left;
+            }}
+            QPushButton:hover {{ border: 2px solid #89b4fa; }}
+        """)
+
+    def update_color_swatch(self, r: int, g: int, b: int, a: int = 255):
+        """스포이드 등 외부에서 색상 업데이트"""
+        self._current_color = (r, g, b, a)
+        self._refresh_color_swatch()
+
+    def get_current_color(self) -> tuple:
+        return self._current_color
+
     def _emit_zoom_in(self):
         self.sig_zoom_in.emit()
 
@@ -370,11 +551,17 @@ class Toolbar(QWidget):
     def set_mode(self, mode: str):
         self._clear_mode_buttons()
         mapping = {
-            "none":    self.btn_move,
-            "grabcut": self.btn_grabcut,
-            "brush":   self.btn_brush,
-            "crop":    self.btn_crop_drag,
-            "polygon": self.btn_polygon,
+            "none":          self.btn_move,
+            "grabcut":       self.btn_grabcut,
+            "brush":         self.btn_brush,
+            "crop":          self.btn_crop_drag,
+            "polygon":       self.btn_polygon,
+            "pipette":       self.btn_pipette,
+            "fill":          self.btn_fill,
+            "color_brush":   self.btn_color_brush,
+            "shape_rect":    self.btn_shape_rect,
+            "shape_ellipse": self.btn_shape_ellipse,
+            "inpaint":       self.btn_inpaint,
         }
         if mode in mapping:
             mapping[mode].setChecked(True)
@@ -390,6 +577,12 @@ class Toolbar(QWidget):
 
     def get_brush_size(self) -> int:
         return self.brush_slider.value()
+
+    def get_shape_line_width(self) -> int:
+        return self._spin_shape_width.value()
+
+    def get_shape_dash_len(self) -> int:
+        return self._spin_shape_dash.value()
 
     @staticmethod
     def _separator() -> QFrame:

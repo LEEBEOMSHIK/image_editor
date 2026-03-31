@@ -89,11 +89,13 @@ class _LayerRow(QWidget):
 
 class LayerPanel(QWidget):
     """레이어 패널"""
-    sig_select     = pyqtSignal(int)        # 인덱스 (-1 = 기본 이미지)
-    sig_delete     = pyqtSignal(int)
-    sig_toggle_vis = pyqtSignal(int, bool)
-    sig_merge_all  = pyqtSignal()
-    sig_add_image  = pyqtSignal()           # 파일 다이얼로그로 추가
+    sig_select        = pyqtSignal(int)        # 인덱스 (-1 = 기본 이미지)
+    sig_delete        = pyqtSignal(int)
+    sig_toggle_vis    = pyqtSignal(int, bool)
+    sig_merge_all     = pyqtSignal()
+    sig_add_image     = pyqtSignal()           # 파일 다이얼로그로 추가
+    sig_reset_size    = pyqtSignal()           # 선택 레이어 원본 크기로 복원
+    sig_fit_to_canvas = pyqtSignal()           # 선택 레이어 캔버스 크기에 맞춤
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -125,6 +127,35 @@ class LayerPanel(QWidget):
         )
         btn_add.clicked.connect(self.sig_add_image)
         layout.addWidget(btn_add)
+
+        # 원본 크기 / 캔버스 맞춤 버튼 (한 줄)
+        size_row = QWidget()
+        size_row.setStyleSheet("background:#181825;border-bottom:1px solid #313244;")
+        size_lay = QHBoxLayout(size_row)
+        size_lay.setContentsMargins(4, 3, 4, 3)
+        size_lay.setSpacing(3)
+
+        btn_reset_sz = QPushButton("↺ 원본 크기")
+        btn_reset_sz.setToolTip("선택한 레이어를 원본 크기로 복원합니다")
+        btn_reset_sz.setStyleSheet(
+            "QPushButton{background:#313244;color:#cdd6f4;border:none;"
+            "padding:4px;font-size:10px;border-radius:4px;}"
+            "QPushButton:hover{background:#45475a;}"
+        )
+        btn_reset_sz.clicked.connect(self.sig_reset_size)
+        size_lay.addWidget(btn_reset_sz)
+
+        btn_fit_cv = QPushButton("⛶ 캔버스 맞춤")
+        btn_fit_cv.setToolTip("선택한 레이어를 작업 캔버스 크기에 꽉 차게 확대합니다")
+        btn_fit_cv.setStyleSheet(
+            "QPushButton{background:#313244;color:#cdd6f4;border:none;"
+            "padding:4px;font-size:10px;border-radius:4px;}"
+            "QPushButton:hover{background:#45475a;}"
+        )
+        btn_fit_cv.clicked.connect(self.sig_fit_to_canvas)
+        size_lay.addWidget(btn_fit_cv)
+
+        layout.addWidget(size_row)
 
         # 레이어 목록
         self._list_container = QWidget()
@@ -187,14 +218,6 @@ class LayerPanel(QWidget):
             self._rows.append(row)
             insert_pos += 1
 
-        # 기본 이미지 행 (항상 맨 아래)
-        base_row = _LayerRow(name="기본 이미지", visible=True,
-                             selected=(active_idx == -1))
-        base_row.sig_select.connect(lambda: self.sig_select.emit(-1))
-        base_row.sig_delete.connect(lambda: self.sig_delete.emit(-1))
-        base_row.sig_toggle_vis.connect(lambda v: self.sig_toggle_vis.emit(-1, v))
-        self._list_layout.insertWidget(insert_pos, base_row)
-        self._rows.append(base_row)
 
 
 # ------------------------------------------------------------------ #
