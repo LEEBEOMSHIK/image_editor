@@ -65,6 +65,8 @@ class MainWindow(QMainWindow):
         self._current_tool_color: tuple = (0, 0, 0, 255)   # 색상 도구 현재 색
         self._color_brush_pending_mask = None               # 색상 브러시 누적 마스크
         self._bg_remove_target_idx: int = -1               # AI 배경 제거 대상 오버레이 인덱스
+        self._last_text_settings: dict | None = None        # 마지막 텍스트 서식 설정 (재사용)
+        self._last_text_settings: dict | None = None        # 마지막 텍스트 서식 설정 (재사용)
 
         self._layer_refresh_timer = QTimer(self)
         self._layer_refresh_timer.setSingleShot(True)
@@ -295,6 +297,9 @@ class MainWindow(QMainWindow):
         self._canvas_edit.shape_committed.connect(self._on_shape_committed)
         self._canvas_edit.inpaint_committed.connect(self._on_inpaint_committed)
 
+        # 텍스트 삽입
+        self._canvas_edit.text_rect_selected.connect(self._on_text_rect_selected)
+
         # 퀵 도구 패널
         qp = self._quick_panel
         qp.sig_mode_changed.connect(self._set_tool_mode)
@@ -337,6 +342,7 @@ class MainWindow(QMainWindow):
             ("B",           lambda: self._set_tool_mode("brush")),
             ("C",           lambda: self._set_tool_mode("crop")),
             ("P",           lambda: self._set_tool_mode("polygon")),
+            ("T",           lambda: self._set_tool_mode("text")),
             ("Ctrl+R",      self._on_reset),
             # 줌
             ("Ctrl+=",      self._canvas_edit.zoom_in),
@@ -998,6 +1004,194 @@ class MainWindow(QMainWindow):
                 self._update_edit_state()
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
+
+    # ------------------------------------------------------------------ #
+    #  텍스트 삽입
+    # ------------------------------------------------------------------ #
+    def _on_text_rect_selected(self, ix: int, iy: int, iw: int, ih: int):
+        """텍스트 박스 드래그 완료 → 서식 다이얼로그 → 오버레이로 추가"""
+        # 드래그 완료 즉시 기본 모드로 복귀 (다이얼로그 취소 시에도)
+        self._set_tool_mode("none")
+        from ui.text_dialog import TextDialog
+        dlg = TextDialog(self, self._last_text_settings)
+        if dlg.exec() != TextDialog.DialogCode.Accepted:
+            return
+        settings = dlg.get_settings()
+        self._last_text_settings = settings
+
+        text = settings["text"].strip()
+        if not text:
+            return
+
+        text_img = self._render_text_to_pil(settings, box_w=iw)
+        if text_img is None:
+            return
+
+        ox = max(0, ix)
+        oy = max(0, iy)
+        self._canvas_edit.add_overlay(text_img, f"텍스트: {text[:12]}", drop_widget_pos=None)
+        overlays = self._canvas_edit.get_overlays()
+        if overlays:
+            idx = len(overlays) - 1
+            self._canvas_edit.move_overlay(idx, ox, oy)
+        self._status.set_message("텍스트 삽입 완료")
+
+    def _render_text_to_pil(self, settings: dict, box_w: int | None = None):
+        """텍스트 서식 설정을 PIL RGBA 이미지로 렌더링. box_w 지정 시 줄 바꿈 적용."""
+        from PIL import Image as _Img, ImageDraw, ImageFont
+
+        text  = settings["text"]
+        size  = settings["size"]
+        bold  = settings["bold"]
+        italic = settings["italic"]
+        under = settings["underline"]
+        color = settings["color"]          # (r, g, b, a)
+        align = settings["align"]
+        font_family = settings["font"]
+
+        font = self._find_pil_font(font_family, size, bold, italic)
+
+        dummy = _Img.new("RGBA", (1, 1))
+        draw = ImageDraw.Draw(dummy)
+
+        raw_lines = text.split("\n")
+        gap_est = max(2, size // 6)
+
+        # box_w 지정 시 자동 줄 바꿈 처리
+        if box_w and box_w > gap_est * 4:
+            max_text_w = box_w - gap_est * 2
+            lines: list[str] = []
+            for raw_line in raw_lines:
+                if not raw_line.strip():
+                    lines.append("")
+                    continue
+                words = raw_line.split(" ")
+                current = ""
+                for word in words:
+                    test = (current + " " + word).strip() if current else word
+                    tw = draw.textbbox((0, 0), test, font=font)[2]
+                    if tw <= max_text_w:
+                        current = test
+                    else:
+                        if current:
+                            lines.append(current)
+                        current = word
+                if current:
+                    lines.append(current)
+        else:
+            lines = raw_lines
+
+        # 줄 크기 측정
+        line_sizes = [draw.textbbox((0, 0), ln or " ", font=font) for ln in lines]
+        line_widths  = [b[2] - b[0] for b in line_sizes]
+        line_heights = [b[3] - b[1] for b in line_sizes]
+        leading = max(line_heights) if line_heights else size
+        gap = max(2, leading // 6)
+
+        total_w = box_w if box_w else (max(line_widths) if line_widths else size) + gap * 2
+        total_h = leading * len(lines) + gap * (len(lines) - 1) + gap * 2
+
+        img = _Img.new("RGBA", (max(1, total_w), max(1, total_h)), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        r, g, b, a = color
+        pil_color = (r, g, b, a)
+
+        y_cursor = gap
+        for i, line in enumerate(lines):
+            lw = line_widths[i] if i < len(line_widths) else 0
+            if align == "left":
+                x_cursor = gap
+            elif align == "center":
+                x_cursor = (total_w - lw) // 2
+            else:  # right
+                x_cursor = total_w - lw - gap
+
+            draw.text((x_cursor, y_cursor), line, font=font, fill=pil_color)
+
+            if under:
+                uy = y_cursor + leading - gap
+                draw.line([(x_cursor, uy), (x_cursor + lw, uy)],
+                          fill=pil_color, width=max(1, size // 20))
+
+            y_cursor += leading + gap
+
+        return img
+
+    def _find_pil_font(self, family: str, size: int, bold: bool, italic: bool):
+        """시스템에서 폰트 파일을 찾아 PIL ImageFont 반환. 실패 시 기본 폰트."""
+        from PIL import ImageFont
+
+        # Windows 폰트 디렉터리 후보
+        win_font_dir = "C:/Windows/Fonts"
+
+        # 폰트명 → 파일명 매핑 (Windows 일반 폰트)
+        candidates = []
+        fname_lower = family.lower().replace(" ", "")
+
+        # 맑은 고딕 / Malgun Gothic
+        if "malgun" in fname_lower or "맑은" in family:
+            if bold:
+                candidates += ["malgunbd.ttf"]
+            candidates += ["malgun.ttf"]
+        # 나눔고딕
+        elif "nanum" in fname_lower or "나눔" in family:
+            if bold:
+                candidates += ["NanumGothicBold.ttf", "NanumGothic_Bold.ttf"]
+            candidates += ["NanumGothic.ttf"]
+        # 굴림
+        elif "gulim" in fname_lower or "굴림" in family:
+            candidates += ["gulim.ttc", "gulim.ttf"]
+        # 돋움
+        elif "dotum" in fname_lower or "돋움" in family:
+            candidates += ["dotum.ttc", "dotum.ttf"]
+        # Arial
+        elif "arial" in fname_lower:
+            if bold and italic:
+                candidates += ["arialbi.ttf"]
+            elif bold:
+                candidates += ["arialbd.ttf"]
+            elif italic:
+                candidates += ["ariali.ttf"]
+            candidates += ["arial.ttf"]
+        # Times New Roman
+        elif "times" in fname_lower:
+            if bold and italic:
+                candidates += ["timesbi.ttf"]
+            elif bold:
+                candidates += ["timesbd.ttf"]
+            elif italic:
+                candidates += ["timesi.ttf"]
+            candidates += ["times.ttf"]
+        # Courier New
+        elif "courier" in fname_lower:
+            if bold and italic:
+                candidates += ["courbi.ttf"]
+            elif bold:
+                candidates += ["courbd.ttf"]
+            elif italic:
+                candidates += ["couri.ttf"]
+            candidates += ["cour.ttf"]
+        # 기본 폴백
+        else:
+            if bold:
+                candidates += ["malgunbd.ttf", "arialbd.ttf"]
+            candidates += ["malgun.ttf", "arial.ttf"]
+
+        # 후보 탐색
+        for fname in candidates:
+            path = os.path.join(win_font_dir, fname)
+            if os.path.isfile(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:
+                    pass
+
+        # 마지막 폴백: PIL 기본 폰트
+        try:
+            return ImageFont.load_default(size=size)
+        except Exception:
+            return ImageFont.load_default()
 
     # ------------------------------------------------------------------ #
     #  크롭

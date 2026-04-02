@@ -96,6 +96,8 @@ class Toolbar(QWidget):
     sig_apply_color_brush  = pyqtSignal()
     sig_clear_color_brush  = pyqtSignal()
 
+    sig_text_mode = pyqtSignal()   # 텍스트 삽입 모드 진입
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(210)
@@ -304,6 +306,19 @@ class Toolbar(QWidget):
 
         layout.addWidget(self._separator())
 
+        # ── 텍스트 ──────────────────────────────────────────
+        layout.addWidget(SectionLabel("🔤  텍스트"))
+
+        self.btn_text = ToolButton("T 텍스트 삽입")
+        self.btn_text.setToolTip(
+            "텍스트 모드  (단축키: T)\n"
+            "캔버스를 클릭하면 텍스트 서식 다이얼로그가 열립니다."
+        )
+        self.btn_text.clicked.connect(self._on_text_toggle)
+        layout.addWidget(self.btn_text)
+
+        layout.addWidget(self._separator())
+
         # ── AI 인페인팅 ──────────────────────────────────────
         layout.addWidget(SectionLabel("✨  빈 영역 채우기"))
         self.btn_inpaint = ToolButton("✨ AI 빈 영역 채우기")
@@ -431,7 +446,7 @@ class Toolbar(QWidget):
     def _all_mode_buttons(self):
         return [self.btn_move, self.btn_grabcut, self.btn_brush, self.btn_crop_drag, self.btn_polygon,
                 self.btn_pipette, self.btn_fill, self.btn_color_brush,
-                self.btn_shape_rect, self.btn_shape_ellipse, self.btn_inpaint]
+                self.btn_shape_rect, self.btn_shape_ellipse, self.btn_inpaint, self.btn_text]
 
     def _clear_mode_buttons(self):
         for btn in self._all_mode_buttons():
@@ -502,6 +517,11 @@ class Toolbar(QWidget):
         self.btn_inpaint.setChecked(True)
         self.sig_mode_changed.emit("inpaint")
 
+    def _on_text_toggle(self):
+        self._clear_mode_buttons()
+        self.btn_text.setChecked(True)
+        self.sig_mode_changed.emit("text")
+
     def _on_pick_color(self):
         """색상 선택 다이얼로그 열기"""
         from PyQt6.QtWidgets import QColorDialog
@@ -562,6 +582,7 @@ class Toolbar(QWidget):
             "shape_rect":    self.btn_shape_rect,
             "shape_ellipse": self.btn_shape_ellipse,
             "inpaint":       self.btn_inpaint,
+            "text":          self.btn_text,
         }
         if mode in mapping:
             mapping[mode].setChecked(True)

@@ -45,6 +45,7 @@ class ImageCanvas(QLabel):
     color_brush_done    = pyqtSignal(object)               # mask array
     shape_committed     = pyqtSignal(str, int, int, int, int)  # shape_type, x, y, w, h (이미지 좌표)
     inpaint_committed   = pyqtSignal(int, int, int, int)       # x, y, w, h (이미지 좌표)
+    text_rect_selected = pyqtSignal(int, int, int, int)         # x, y, w, h (이미지 좌표) — 텍스트 박스 드래그 영역
 
     MODE_NONE         = "none"
     MODE_CROP         = "crop"
@@ -58,6 +59,7 @@ class ImageCanvas(QLabel):
     MODE_SHAPE_RECT    = "shape_rect"    # 점선 사각형 그리기
     MODE_SHAPE_ELLIPSE = "shape_ellipse" # 점선 원/타원 그리기
     MODE_INPAINT       = "inpaint"       # AI 빈 영역 채우기 영역 드래그
+    MODE_TEXT          = "text"          # 텍스트 삽입
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -101,6 +103,10 @@ class ImageCanvas(QLabel):
         # 인페인팅 영역 드래그
         self._inpaint_drag_start: QPoint | None = None
         self._inpaint_rect: QRect | None = None
+
+        # 텍스트 박스 드래그
+        self._text_drag_start: QPoint | None = None
+        self._text_rect: QRect | None = None
 
         # 다각형
         self._poly_image_pts: list[tuple[int, int]] = []
@@ -183,6 +189,9 @@ class ImageCanvas(QLabel):
         if mode != self.MODE_INPAINT:
             self._inpaint_rect = None
             self._inpaint_drag_start = None
+        if mode != self.MODE_TEXT:
+            self._text_drag_start = None
+            self._text_rect = None
         cursors = {
             self.MODE_BRUSH:         Qt.CursorShape.CrossCursor,
             self.MODE_CROP:          Qt.CursorShape.CrossCursor,
@@ -195,6 +204,7 @@ class ImageCanvas(QLabel):
             self.MODE_SHAPE_RECT:    Qt.CursorShape.CrossCursor,
             self.MODE_SHAPE_ELLIPSE: Qt.CursorShape.CrossCursor,
             self.MODE_INPAINT:       Qt.CursorShape.CrossCursor,
+            self.MODE_TEXT:          Qt.CursorShape.CrossCursor,
         }
         self.setCursor(QCursor(cursors.get(mode, Qt.CursorShape.ArrowCursor)))
         self.update()
@@ -286,6 +296,13 @@ class ImageCanvas(QLabel):
 
     def get_overlays(self) -> list[dict]:
         return self._overlays
+
+    def move_overlay(self, index: int, x: int, y: int):
+        """오버레이 위치를 이미지 좌표로 설정"""
+        if 0 <= index < len(self._overlays):
+            self._overlays[index]['x'] = x
+            self._overlays[index]['y'] = y
+            self.update()
 
     def clear_overlays(self):
         self._overlays.clear()
@@ -598,6 +615,20 @@ class ImageCanvas(QLabel):
             painter.setPen(border)
             painter.drawText(self._selection_rect.x() + 5, self._selection_rect.y() - 6, label)
 
+        # ── 텍스트 박스 드래그 미리보기 (초록 점선) ──────────────────────
+        if self._text_rect and self._mode == self.MODE_TEXT:
+            tr = self._text_rect
+            painter.fillRect(tr, QColor(100, 215, 100, 30))
+            painter.setPen(QPen(QColor(100, 215, 100, 220), 2, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(tr)
+            f = painter.font(); f.setBold(True); f.setPointSize(9); painter.setFont(f)
+            painter.setPen(QColor(100, 215, 100, 220))
+            painter.drawText(tr.x() + 5, tr.y() - 6, "T 텍스트 영역")
+            painter.setPen(QColor(100, 215, 100, 180))
+            f2 = painter.font(); f2.setBold(False); f2.setPointSize(8); painter.setFont(f2)
+            painter.drawText(tr.x() + 4, tr.bottom() - 5, "드래그 후 손 떼면 다이얼로그 열림")
+
         # ── 크기 지정 크롭 미리보기 (노란 박스) ─────────────────────────
         if self._mode == self.MODE_CROP_SIZE and self._crop_preview_rect and self._pixmap:
             r = self._crop_preview_rect
@@ -847,6 +878,13 @@ class ImageCanvas(QLabel):
             self._inpaint_rect = None
             return
 
+        # 텍스트 삽입 모드 — 드래그로 텍스트 박스 영역 선택
+        if self._mode == self.MODE_TEXT:
+            if self._pil_image:
+                self._text_drag_start = pos
+                self._text_rect = None
+            return
+
         self._drag_start = pos
         self._selection_rect = None
 
@@ -964,6 +1002,9 @@ class ImageCanvas(QLabel):
         elif self._mode == self.MODE_INPAINT and self._inpaint_drag_start:
             self._inpaint_rect = QRect(self._inpaint_drag_start, pos).normalized()
             self.update()
+        elif self._mode == self.MODE_TEXT and self._text_drag_start:
+            self._text_rect = QRect(self._text_drag_start, pos).normalized()
+            self.update()
 
         # 호버 상태 업데이트 (미니맵 + 오버레이 커서)
         self._update_hover_state(pos)
@@ -1076,6 +1117,15 @@ class ImageCanvas(QLabel):
                 self._emit_inpaint_signal(rect)
             self._inpaint_drag_start = None
 
+        elif self._mode == self.MODE_TEXT:
+            if self._text_drag_start and self._text_rect:
+                rect = QRect(self._text_drag_start, pos).normalized()
+                self._text_rect = None
+                self.update()
+                if rect.width() > 5 and rect.height() > 5:
+                    self._emit_text_rect_signal(rect)
+            self._text_drag_start = None
+
         self._drag_start = None
 
     def mouseDoubleClickEvent(self, event):
@@ -1161,7 +1211,7 @@ class ImageCanvas(QLabel):
     def _get_corner_handles(self, index: int) -> list:
         """Active overlay 의 4 코너 핸들 사각형 (위젯 좌표)"""
         r = self._overlay_widget_rect(index)
-        hs = 8
+        hs = 5
         return [
             QRect(r.left() - hs, r.top() - hs, hs * 2, hs * 2),     # 0: TL
             QRect(r.right() - hs, r.top() - hs, hs * 2, hs * 2),    # 1: TR
@@ -1266,6 +1316,17 @@ class ImageCanvas(QLabel):
         w = max(1, img_br.x() - x)
         h = max(1, img_br.y() - y)
         self.inpaint_committed.emit(x, y, w, h)
+
+    def _emit_text_rect_signal(self, widget_rect: QRect):
+        """위젯 좌표 rect → 이미지 좌표로 변환 후 text_rect_selected 발생"""
+        if self._pil_image is None:
+            return
+        img_tl = self._widget_to_image(widget_rect.topLeft())
+        img_br = self._widget_to_image(widget_rect.bottomRight())
+        x, y = img_tl.x(), img_tl.y()
+        w = max(1, img_br.x() - x)
+        h = max(1, img_br.y() - y)
+        self.text_rect_selected.emit(x, y, w, h)
 
     def _draw_brush(self, widget_pos: QPoint):
         if self._pil_image is None or self._brush_mask is None:
