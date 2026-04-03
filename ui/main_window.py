@@ -66,7 +66,7 @@ class MainWindow(QMainWindow):
         self._color_brush_pending_mask = None               # 색상 브러시 누적 마스크
         self._bg_remove_target_idx: int = -1               # AI 배경 제거 대상 오버레이 인덱스
         self._last_text_settings: dict | None = None        # 마지막 텍스트 서식 설정 (재사용)
-        self._last_text_settings: dict | None = None        # 마지막 텍스트 서식 설정 (재사용)
+        self._pending_text_rect: tuple | None = None         # 텍스트 드래그 영역 임시 저장
 
         self._layer_refresh_timer = QTimer(self)
         self._layer_refresh_timer.setSingleShot(True)
@@ -144,6 +144,7 @@ class MainWindow(QMainWindow):
         # 퀵 도구 패널 (캔버스 위에 오버레이로 표시, 드래그 가능)
         self._quick_panel = QuickToolPanel(central)
         self._quick_panel.raise_()
+
 
     def _make_preview_panel(self, title: str) -> QWidget:
         w = QWidget()
@@ -297,8 +298,8 @@ class MainWindow(QMainWindow):
         self._canvas_edit.shape_committed.connect(self._on_shape_committed)
         self._canvas_edit.inpaint_committed.connect(self._on_inpaint_committed)
 
-        # 텍스트 삽입
-        self._canvas_edit.text_rect_selected.connect(self._on_text_rect_selected)
+        # 텍스트 삽입 (인라인 에디터가 canvas 내부에서 처리 후 text_committed 발생)
+        self._canvas_edit.text_committed.connect(self._on_text_committed)
 
         # 퀵 도구 패널
         qp = self._quick_panel
@@ -641,6 +642,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _on_mode_changed(self, mode: str):
         self._canvas_edit.set_mode(mode)
+        # 텍스트 모드 진입 시 이전 서식 설정을 인라인 에디터에 미리 전달
+        if mode == "text" and self._last_text_settings:
+            self._canvas_edit._inline_editor._bar.load_settings(self._last_text_settings)
         mode_labels = {
             "none":          "기본 모드",
             "crop":          "드래그로 크롭 영역을 선택하세요",
@@ -652,6 +656,7 @@ class MainWindow(QMainWindow):
             "shape_rect":    "드래그로 점선 사각형 영역을 지정하세요",
             "shape_ellipse": "드래그로 점선 원/타원 영역을 지정하세요",
             "inpaint":       "드래그로 AI 채우기 영역을 선택하세요 — 드래그 완료 시 자동 적용",
+            "text":          "드래그로 텍스트 박스 영역을 지정하세요",
         }
         self._status.set_message(mode_labels.get(mode, ""))
 
@@ -980,6 +985,7 @@ class MainWindow(QMainWindow):
                     f"({x},{y}) {w}×{h}  #{r:02x}{g:02x}{b:02x}"
                 )
                 self._update_edit_state()
+            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -1002,25 +1008,23 @@ class MainWindow(QMainWindow):
                 self._canvas_edit.set_image(img)
                 self._status.set_message(f"빈 영역 채우기 완료: ({x},{y}) {w}×{h}")
                 self._update_edit_state()
+            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
     # ------------------------------------------------------------------ #
     #  텍스트 삽입
     # ------------------------------------------------------------------ #
-    def _on_text_rect_selected(self, ix: int, iy: int, iw: int, ih: int):
-        """텍스트 박스 드래그 완료 → 서식 다이얼로그 → 오버레이로 추가"""
-        # 드래그 완료 즉시 기본 모드로 복귀 (다이얼로그 취소 시에도)
-        self._set_tool_mode("none")
-        from ui.text_dialog import TextDialog
-        dlg = TextDialog(self, self._last_text_settings)
-        if dlg.exec() != TextDialog.DialogCode.Accepted:
-            return
-        settings = dlg.get_settings()
+    def _on_text_committed(self, settings: dict, ix: int, iy: int, iw: int, ih: int):
+        """인라인 에디터 삽입 확정 → PIL 렌더링 후 오버레이로 추가"""
+        # 인라인 에디터가 canvas.set_mode(none)을 이미 호출했으므로 툴바만 동기화
+        self._toolbar.set_mode("none")
+        self._quick_panel.set_mode("none")
         self._last_text_settings = settings
 
         text = settings["text"].strip()
         if not text:
+            self._status.set_message("텍스트가 비어 있습니다")
             return
 
         text_img = self._render_text_to_pil(settings, box_w=iw)
@@ -1209,6 +1213,7 @@ class MainWindow(QMainWindow):
                 self._workspace_size_lbl.setText(f"작업 크기: {nw} × {nh} px")
                 self._status.set_message(f"크롭 완료: {nw}×{nh}")
                 self._update_edit_state()
+            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 

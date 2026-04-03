@@ -5,6 +5,7 @@ ui/canvas.py
 import os
 import numpy as np
 from PyQt6.QtWidgets import QLabel, QSizePolicy
+from ui.inline_text_editor import InlineTextEditor
 from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal
 from PyQt6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QCursor, QBrush, QPolygon
@@ -45,7 +46,7 @@ class ImageCanvas(QLabel):
     color_brush_done    = pyqtSignal(object)               # mask array
     shape_committed     = pyqtSignal(str, int, int, int, int)  # shape_type, x, y, w, h (이미지 좌표)
     inpaint_committed   = pyqtSignal(int, int, int, int)       # x, y, w, h (이미지 좌표)
-    text_rect_selected = pyqtSignal(int, int, int, int)         # x, y, w, h (이미지 좌표) — 텍스트 박스 드래그 영역
+    text_committed     = pyqtSignal(dict, int, int, int, int)   # settings, x, y, w, h (이미지 좌표) — 텍스트 삽입 확정
 
     MODE_NONE         = "none"
     MODE_CROP         = "crop"
@@ -144,6 +145,12 @@ class ImageCanvas(QLabel):
         # 드래그 앤 드롭 활성화
         self.setAcceptDrops(True)
 
+        # 인라인 텍스트 에디터 (드래그 위치에 직접 표시)
+        self._inline_editor = InlineTextEditor(self)
+        self._inline_editor.sig_committed.connect(self._on_inline_text_committed)
+        self._inline_editor.sig_cancelled.connect(self._on_inline_text_cancelled)
+        self._pending_text_img_rect: tuple | None = None   # (ix, iy, iw, ih) 이미지 좌표
+
         # 작업 영역 배경 타일 픽스맵
         self._bg_tile_pixmap: QPixmap | None = None
         try:
@@ -192,6 +199,10 @@ class ImageCanvas(QLabel):
         if mode != self.MODE_TEXT:
             self._text_drag_start = None
             self._text_rect = None
+            # 인라인 에디터가 열려 있으면 닫기 (모드 전환 시)
+            if hasattr(self, '_inline_editor') and self._inline_editor.isVisible():
+                self._inline_editor.hide()
+                self._pending_text_img_rect = None
         cursors = {
             self.MODE_BRUSH:         Qt.CursorShape.CrossCursor,
             self.MODE_CROP:          Qt.CursorShape.CrossCursor,
@@ -1318,7 +1329,7 @@ class ImageCanvas(QLabel):
         self.inpaint_committed.emit(x, y, w, h)
 
     def _emit_text_rect_signal(self, widget_rect: QRect):
-        """위젯 좌표 rect → 이미지 좌표로 변환 후 text_rect_selected 발생"""
+        """드래그 완료 → 인라인 에디터를 드래그 위치에 표시."""
         if self._pil_image is None:
             return
         img_tl = self._widget_to_image(widget_rect.topLeft())
@@ -1326,7 +1337,22 @@ class ImageCanvas(QLabel):
         x, y = img_tl.x(), img_tl.y()
         w = max(1, img_br.x() - x)
         h = max(1, img_br.y() - y)
-        self.text_rect_selected.emit(x, y, w, h)
+        self._pending_text_img_rect = (x, y, w, h)
+        self._inline_editor.show_at_rect(widget_rect)
+
+    def _on_inline_text_committed(self, settings: dict):
+        """인라인 에디터 '삽입' 확정 → text_committed 시그널 발생."""
+        if self._pending_text_img_rect is None:
+            return
+        ix, iy, iw, ih = self._pending_text_img_rect
+        self._pending_text_img_rect = None
+        self.set_mode(self.MODE_NONE)
+        self.text_committed.emit(settings, ix, iy, iw, ih)
+
+    def _on_inline_text_cancelled(self):
+        """인라인 에디터 취소 → 모드 초기화."""
+        self._pending_text_img_rect = None
+        self.set_mode(self.MODE_NONE)
 
     def _draw_brush(self, widget_pos: QPoint):
         if self._pil_image is None or self._brush_mask is None:
