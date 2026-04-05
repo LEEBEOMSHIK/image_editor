@@ -6,9 +6,9 @@ import os
 import numpy as np
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 from ui.inline_text_editor import InlineTextEditor
-from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QRect, QPointF, pyqtSignal
 from PyQt6.QtGui import (
-    QPixmap, QImage, QPainter, QPen, QColor, QCursor, QBrush, QPolygon
+    QPixmap, QImage, QPainter, QPen, QColor, QCursor, QBrush, QPolygon, QPolygonF
 )
 from PIL import Image
 
@@ -46,7 +46,9 @@ class ImageCanvas(QLabel):
     color_brush_done    = pyqtSignal(object)               # mask array
     shape_committed     = pyqtSignal(str, int, int, int, int)  # shape_type, x, y, w, h (이미지 좌표)
     inpaint_committed   = pyqtSignal(int, int, int, int)       # x, y, w, h (이미지 좌표)
-    text_committed     = pyqtSignal(dict, int, int, int, int)   # settings, x, y, w, h (이미지 좌표) — 텍스트 삽입 확정
+    text_committed       = pyqtSignal(dict, int, int, int, int)  # settings, x, y, w, h (이미지 좌표) — 새 텍스트 삽입 확정
+    text_edit_committed  = pyqtSignal(dict, int, int, int, int)  # settings, overlay_idx, ix, iy — 기존 텍스트 오버레이 수정 확정 (iw=disp_w)
+    text_overlay_resized = pyqtSignal(int, int)                   # overlay_idx, new_disp_w — 텍스트 오버레이 너비 변경 후 재렌더링 요청
 
     MODE_NONE         = "none"
     MODE_CROP         = "crop"
@@ -61,6 +63,7 @@ class ImageCanvas(QLabel):
     MODE_SHAPE_ELLIPSE = "shape_ellipse" # 점선 원/타원 그리기
     MODE_INPAINT       = "inpaint"       # AI 빈 영역 채우기 영역 드래그
     MODE_TEXT          = "text"          # 텍스트 삽입
+    MODE_SELECT        = "select"        # 선택/편집 모드 (텍스트 클릭 → 편집, 오버레이 드래그)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -150,6 +153,7 @@ class ImageCanvas(QLabel):
         self._inline_editor.sig_committed.connect(self._on_inline_text_committed)
         self._inline_editor.sig_cancelled.connect(self._on_inline_text_cancelled)
         self._pending_text_img_rect: tuple | None = None   # (ix, iy, iw, ih) 이미지 좌표
+        self._editing_overlay_idx: int = -1                # 편집 중인 오버레이 인덱스 (-1 = 새 텍스트)
 
         # 작업 영역 배경 타일 픽스맵
         self._bg_tile_pixmap: QPixmap | None = None
@@ -196,28 +200,33 @@ class ImageCanvas(QLabel):
         if mode != self.MODE_INPAINT:
             self._inpaint_rect = None
             self._inpaint_drag_start = None
-        if mode != self.MODE_TEXT:
+        if mode not in (self.MODE_TEXT, self.MODE_SELECT):
             self._text_drag_start = None
             self._text_rect = None
+            self._pending_text_img_rect = None
+            if hasattr(self, '_editing_overlay_idx'):
+                self._editing_overlay_idx = -1
             # 인라인 에디터가 열려 있으면 닫기 (모드 전환 시)
             if hasattr(self, '_inline_editor') and self._inline_editor.isVisible():
                 self._inline_editor.hide()
-                self._pending_text_img_rect = None
-        cursors = {
-            self.MODE_BRUSH:         Qt.CursorShape.CrossCursor,
-            self.MODE_CROP:          Qt.CursorShape.CrossCursor,
-            self.MODE_GRABCUT:       Qt.CursorShape.CrossCursor,
-            self.MODE_POLYGON:       Qt.CursorShape.CrossCursor,
-            self.MODE_CROP_SIZE:     Qt.CursorShape.SizeAllCursor,
-            self.MODE_PIPETTE:       Qt.CursorShape.CrossCursor,
-            self.MODE_FILL:          Qt.CursorShape.CrossCursor,
-            self.MODE_COLOR_BRUSH:   Qt.CursorShape.CrossCursor,
-            self.MODE_SHAPE_RECT:    Qt.CursorShape.CrossCursor,
-            self.MODE_SHAPE_ELLIPSE: Qt.CursorShape.CrossCursor,
-            self.MODE_INPAINT:       Qt.CursorShape.CrossCursor,
-            self.MODE_TEXT:          Qt.CursorShape.CrossCursor,
-        }
-        self.setCursor(QCursor(cursors.get(mode, Qt.CursorShape.ArrowCursor)))
+        if mode == self.MODE_PIPETTE:
+            self.setCursor(self._make_eyedropper_cursor())
+        else:
+            cursors = {
+                self.MODE_BRUSH:         Qt.CursorShape.CrossCursor,
+                self.MODE_CROP:          Qt.CursorShape.CrossCursor,
+                self.MODE_GRABCUT:       Qt.CursorShape.CrossCursor,
+                self.MODE_POLYGON:       Qt.CursorShape.CrossCursor,
+                self.MODE_CROP_SIZE:     Qt.CursorShape.SizeAllCursor,
+                self.MODE_FILL:          Qt.CursorShape.CrossCursor,
+                self.MODE_COLOR_BRUSH:   Qt.CursorShape.CrossCursor,
+                self.MODE_SHAPE_RECT:    Qt.CursorShape.CrossCursor,
+                self.MODE_SHAPE_ELLIPSE: Qt.CursorShape.CrossCursor,
+                self.MODE_INPAINT:       Qt.CursorShape.CrossCursor,
+                self.MODE_TEXT:          Qt.CursorShape.CrossCursor,
+                self.MODE_SELECT:        Qt.CursorShape.ArrowCursor,
+            }
+            self.setCursor(QCursor(cursors.get(mode, Qt.CursorShape.ArrowCursor)))
         self.update()
 
     def set_brush_size(self, size: int):
@@ -626,7 +635,7 @@ class ImageCanvas(QLabel):
             painter.setPen(border)
             painter.drawText(self._selection_rect.x() + 5, self._selection_rect.y() - 6, label)
 
-        # ── 텍스트 박스 드래그 미리보기 (초록 점선) ──────────────────────
+        # ── 텍스트 박스 드래그 중 미리보기 (초록 점선) ────────────────────
         if self._text_rect and self._mode == self.MODE_TEXT:
             tr = self._text_rect
             painter.fillRect(tr, QColor(100, 215, 100, 30))
@@ -636,9 +645,9 @@ class ImageCanvas(QLabel):
             f = painter.font(); f.setBold(True); f.setPointSize(9); painter.setFont(f)
             painter.setPen(QColor(100, 215, 100, 220))
             painter.drawText(tr.x() + 5, tr.y() - 6, "T 텍스트 영역")
-            painter.setPen(QColor(100, 215, 100, 180))
             f2 = painter.font(); f2.setBold(False); f2.setPointSize(8); painter.setFont(f2)
-            painter.drawText(tr.x() + 4, tr.bottom() - 5, "드래그 후 손 떼면 다이얼로그 열림")
+            painter.setPen(QColor(100, 215, 100, 180))
+            painter.drawText(tr.x() + 4, tr.bottom() - 5, "손 떼면 편집기 열림")
 
         # ── 크기 지정 크롭 미리보기 (노란 박스) ─────────────────────────
         if self._mode == self.MODE_CROP_SIZE and self._crop_preview_rect and self._pixmap:
@@ -770,6 +779,12 @@ class ImageCanvas(QLabel):
     def mousePressEvent(self, event):
         pos = event.position().toPoint()
 
+        # 텍스트 에디터가 열려 있을 때 바깥 클릭 → 자동 확정
+        # (에디터 위젯 또는 자식에 대한 클릭은 canvas.mousePressEvent 까지 오지 않음)
+        if self._inline_editor.isVisible() and event.button() == Qt.MouseButton.LeftButton:
+            self._inline_editor.commit()
+            return
+
         # 미니맵 리사이즈 핸들 검사
         mr = self._minimap_rect()
         if not mr.isEmpty():
@@ -889,12 +904,67 @@ class ImageCanvas(QLabel):
             self._inpaint_rect = None
             return
 
-        # 텍스트 삽입 모드 — 드래그로 텍스트 박스 영역 선택
+        # 텍스트 삽입 모드 — 기존 텍스트 클릭 시 편집, 빈 영역 드래그 시 새 박스
         if self._mode == self.MODE_TEXT:
             if self._pil_image:
+                if self._inline_editor.isVisible():
+                    self._inline_editor.hide()
+                # 기존 텍스트 오버레이 클릭 감지 → 편집 모드 전환
+                hit = self._hit_overlay(pos)
+                if hit >= 0 and 'text_settings' in self._overlays[hit]:
+                    self._open_text_edit_overlay(hit)
+                    return
                 self._text_drag_start = pos
                 self._text_rect = None
             return
+
+        # 선택/편집 모드 — 텍스트 오버레이 클릭 시 편집, 일반 오버레이는 선택+드래그
+        if self._mode == self.MODE_SELECT:
+            hit = self._hit_overlay(pos) if self._overlays else -1
+            if hit >= 0:
+                corner = self._hit_corner_handle(pos, hit)
+                if corner >= 0:
+                    self._active_overlay = hit
+                    self._base_selected = False
+                    self._ov_resize_corner = corner
+                    ov = self._overlays[hit]
+                    self._ov_resize_start = (
+                        pos, ov['x'], ov['y'],
+                        ov.get('disp_w', ov['pil'].width),
+                        ov.get('disp_h', ov['pil'].height),
+                    )
+                    resize_cursors = [
+                        Qt.CursorShape.SizeFDiagCursor,
+                        Qt.CursorShape.SizeBDiagCursor,
+                        Qt.CursorShape.SizeBDiagCursor,
+                        Qt.CursorShape.SizeFDiagCursor,
+                    ]
+                    self.setCursor(QCursor(resize_cursors[corner]))
+                    self.overlay_selected.emit(hit)
+                    self.update()
+                    return
+                if 'text_settings' in self._overlays[hit]:
+                    # 텍스트 오버레이 클릭 → 편집
+                    self._open_text_edit_overlay(hit)
+                    return
+                # 일반 오버레이 → 선택 + 드래그
+                self._active_overlay = hit
+                self._base_selected = False
+                self._ov_drag_start = pos
+                self._ov_drag_start_pos = (
+                    self._overlays[hit]['x'], self._overlays[hit]['y']
+                )
+                self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+                self.overlay_selected.emit(hit)
+                self.update()
+                return
+            else:
+                # 빈 공간 클릭 → 선택 해제
+                self._active_overlay = -1
+                self._base_selected = False
+                self.overlay_selected.emit(-1)
+                self.update()
+                return
 
         self._drag_start = pos
         self._selection_rect = None
@@ -1033,20 +1103,22 @@ class ImageCanvas(QLabel):
         if self._left_pan_start is not None and event.button() == Qt.MouseButton.LeftButton:
             self._left_pan_start = None
             self._left_pan_start_offset = None
-            cursors = {
-                self.MODE_BRUSH:         Qt.CursorShape.CrossCursor,
-                self.MODE_CROP:          Qt.CursorShape.CrossCursor,
-                self.MODE_GRABCUT:       Qt.CursorShape.CrossCursor,
-                self.MODE_POLYGON:       Qt.CursorShape.CrossCursor,
-                self.MODE_CROP_SIZE:     Qt.CursorShape.SizeAllCursor,
-                self.MODE_PIPETTE:       Qt.CursorShape.CrossCursor,
-                self.MODE_FILL:          Qt.CursorShape.CrossCursor,
-                self.MODE_COLOR_BRUSH:   Qt.CursorShape.CrossCursor,
-                self.MODE_SHAPE_RECT:    Qt.CursorShape.CrossCursor,
-                self.MODE_SHAPE_ELLIPSE: Qt.CursorShape.CrossCursor,
-                self.MODE_INPAINT:       Qt.CursorShape.CrossCursor,
-            }
-            self.setCursor(QCursor(cursors.get(self._mode, Qt.CursorShape.ArrowCursor)))
+            if self._mode == self.MODE_PIPETTE:
+                self.setCursor(self._make_eyedropper_cursor())
+            else:
+                cursors = {
+                    self.MODE_BRUSH:         Qt.CursorShape.CrossCursor,
+                    self.MODE_CROP:          Qt.CursorShape.CrossCursor,
+                    self.MODE_GRABCUT:       Qt.CursorShape.CrossCursor,
+                    self.MODE_POLYGON:       Qt.CursorShape.CrossCursor,
+                    self.MODE_CROP_SIZE:     Qt.CursorShape.SizeAllCursor,
+                    self.MODE_FILL:          Qt.CursorShape.CrossCursor,
+                    self.MODE_COLOR_BRUSH:   Qt.CursorShape.CrossCursor,
+                    self.MODE_SHAPE_RECT:    Qt.CursorShape.CrossCursor,
+                    self.MODE_SHAPE_ELLIPSE: Qt.CursorShape.CrossCursor,
+                    self.MODE_INPAINT:       Qt.CursorShape.CrossCursor,
+                }
+                self.setCursor(QCursor(cursors.get(self._mode, Qt.CursorShape.ArrowCursor)))
 
         # 오버레이 리사이즈 종료
         if self._ov_resize_start is not None:
@@ -1056,6 +1128,9 @@ class ImageCanvas(QLabel):
             if 0 <= idx < len(self._overlays):
                 ov = self._overlays[idx]
                 self.overlay_moved.emit(idx, ov['x'], ov['y'])
+                # 텍스트 오버레이이면 새 너비로 텍스트 재렌더링 요청
+                if 'text_settings' in ov:
+                    self.text_overlay_resized.emit(idx, ov.get('disp_w', ov['pil'].width))
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
             return
 
@@ -1189,7 +1264,7 @@ class ImageCanvas(QLabel):
             ))
             return
 
-        if self._mode != self.MODE_NONE:
+        if self._mode not in (self.MODE_NONE, self.MODE_SELECT):
             return
 
         hit = self._hit_overlay(pos)
@@ -1203,6 +1278,10 @@ class ImageCanvas(QLabel):
                     Qt.CursorShape.SizeFDiagCursor,
                 ]
                 self.setCursor(QCursor(resize_cursors[corner]))
+            elif (self._mode == self.MODE_SELECT
+                  and 'text_settings' in self._overlays[hit]):
+                # 선택/편집 모드에서 텍스트 오버레이 위 → 편집 커서
+                self.setCursor(QCursor(Qt.CursorShape.IBeamCursor))
             else:
                 self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
         else:
@@ -1341,18 +1420,79 @@ class ImageCanvas(QLabel):
         self._inline_editor.show_at_rect(widget_rect)
 
     def _on_inline_text_committed(self, settings: dict):
-        """인라인 에디터 '삽입' 확정 → text_committed 시그널 발생."""
+        """인라인 에디터 '삽입' 확정 → 신규/수정 여부에 따라 시그널 발생."""
         if self._pending_text_img_rect is None:
             return
         ix, iy, iw, ih = self._pending_text_img_rect
         self._pending_text_img_rect = None
-        self.set_mode(self.MODE_NONE)
-        self.text_committed.emit(settings, ix, iy, iw, ih)
+        if self._editing_overlay_idx >= 0:
+            # 기존 텍스트 오버레이 수정
+            edit_idx = self._editing_overlay_idx
+            self._editing_overlay_idx = -1
+            self.text_edit_committed.emit(settings, edit_idx, ix, iy, iw, ih)
+        else:
+            # 새 텍스트 삽입
+            self.text_committed.emit(settings, ix, iy, iw, ih)
 
     def _on_inline_text_cancelled(self):
-        """인라인 에디터 취소 → 모드 초기화."""
+        """인라인 에디터 취소 — 텍스트/선택 모드 유지."""
         self._pending_text_img_rect = None
-        self.set_mode(self.MODE_NONE)
+        self._editing_overlay_idx = -1
+
+    def _open_text_edit_overlay(self, idx: int):
+        """기존 텍스트 오버레이를 인라인 에디터로 편집 모드 진입."""
+        ov = self._overlays[idx]
+        settings = ov.get('text_settings', {})
+        ov_rect = self._overlay_widget_rect(idx)
+        self._editing_overlay_idx = idx
+        self._active_overlay = idx
+        # 이미지 좌표 (ix, iy, iw, ih) — 수정 후 같은 위치·크기로 재렌더링
+        self._pending_text_img_rect = (
+            ov['x'], ov['y'],
+            ov.get('disp_w', ov['pil'].width),
+            ov.get('disp_h', ov['pil'].height),
+        )
+        initial_text = settings.get('text', '')
+        self._inline_editor.show_at_rect(ov_rect, prev_settings=settings,
+                                          initial_text=initial_text)
+        self.overlay_selected.emit(idx)
+        self.update()
+
+    @staticmethod
+    def _make_eyedropper_cursor() -> QCursor:
+        """스포이드(색 추출) 모양의 커서 생성."""
+        size = 32
+        px = QPixmap(size, size)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # 스포이드 몸통 (대각선 막대, 좌하단 → 우상단)
+        # 흰색 외곽선 (가시성 확보)
+        pen_white = QPen(QColor(255, 255, 255, 220), 4)
+        pen_white.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen_white)
+        p.drawLine(5, 27, 22, 10)
+
+        # 검은 막대
+        pen_black = QPen(QColor(30, 30, 30, 255), 2.5)
+        pen_black.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen_black)
+        p.drawLine(5, 27, 22, 10)
+
+        # 핸들 상단 원형 캡
+        p.setPen(QPen(QColor(30, 30, 30), 1.5))
+        p.setBrush(QBrush(QColor(180, 180, 180, 230)))
+        p.drawEllipse(QPointF(22, 9), 4.5, 4.5)
+
+        # 팁 끝 작은 원
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(220, 50, 50)))
+        p.drawEllipse(QPointF(5, 27), 2.5, 2.5)
+
+        p.end()
+        # 핫스팟: 스포이드 팁 (좌하단)
+        return QCursor(px, 5, 27)
 
     def _draw_brush(self, widget_pos: QPoint):
         if self._pil_image is None or self._brush_mask is None:

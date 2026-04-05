@@ -54,7 +54,7 @@ class _FormatBar(QFrame):
         # 크기
         self._spin_size = QSpinBox()
         self._spin_size.setRange(6, 500)
-        self._spin_size.setValue(36)
+        self._spin_size.setValue(12)
         self._spin_size.setFixedWidth(52)
         self._spin_size.setToolTip("글자 크기")
         self._spin_size.setStyleSheet(self._spin_style())
@@ -139,7 +139,7 @@ class _FormatBar(QFrame):
         self._font_combo.blockSignals(True)
         self._spin_size.blockSignals(True)
         self._font_combo.setCurrentFont(QFont(s.get("font", "맑은 고딕")))
-        self._spin_size.setValue(s.get("size", 36))
+        self._spin_size.setValue(s.get("size", 12))
         self._btn_bold.setChecked(s.get("bold", False))
         self._btn_italic.setChecked(s.get("italic", False))
         self._btn_underline.setChecked(s.get("underline", False))
@@ -260,7 +260,8 @@ class InlineTextEditor(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.Widget)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        # 배경을 투명으로 해야 바(bar) 영역만 보임 (서식 바가 전체 너비를 사용)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         # 캔버스 위에 그냥 올라오는 자식 위젯이므로 크기는 show_at_rect에서 설정
         self.hide()
 
@@ -292,10 +293,12 @@ class InlineTextEditor(QWidget):
     # ------------------------------------------------------------------ #
     #  공개 API
     # ------------------------------------------------------------------ #
-    def show_at_rect(self, widget_rect: QRect, prev_settings: dict | None = None):
+    def show_at_rect(self, widget_rect: QRect, prev_settings: dict | None = None,
+                     initial_text: str = ""):
         """
         canvas 위젯 좌표 widget_rect에 맞춰 에디터를 배치하고 표시합니다.
-        서식 바는 텍스트 영역 바로 위(공간이 없으면 아래)에 배치됩니다.
+        서식 바는 부모(캔버스) 전체 너비로 확장되며, 텍스트 영역 위/아래에 배치됩니다.
+        initial_text 가 있으면 텍스트 입력 영역을 그 내용으로 초기화합니다.
         """
         if prev_settings:
             self._bar.load_settings(prev_settings)
@@ -306,21 +309,27 @@ class InlineTextEditor(QWidget):
         rh  = max(widget_rect.height(), 40)
         rx, ry = widget_rect.x(), widget_rect.y()
 
+        # 서식 바는 부모(캔버스) 전체 너비로 확장
+        parent_w = self.parent().width() if self.parent() else rw
+        bar_w = max(parent_w, rw)
+
         bar_above = ry >= bh + gap + 4
 
         if bar_above:
             # 서식 바 위 → 텍스트 아래
-            self.setGeometry(rx, ry - bh - gap, rw, rh + bh + gap)
-            self._bar.setGeometry(0, 0, rw, bh)
-            self._edit.setGeometry(0, bh + gap, rw, rh)
+            self.setGeometry(0, ry - bh - gap, bar_w, rh + bh + gap)
+            self._bar.setGeometry(0, 0, bar_w, bh)
+            self._edit.setGeometry(rx, bh + gap, rw, rh)
         else:
             # 서식 바 아래 → 텍스트 위
-            self.setGeometry(rx, ry, rw, rh + bh + gap)
-            self._edit.setGeometry(0, 0, rw, rh)
-            self._bar.setGeometry(0, rh + gap, rw, bh)
+            self.setGeometry(0, ry, bar_w, rh + bh + gap)
+            self._edit.setGeometry(rx, 0, rw, rh)
+            self._bar.setGeometry(0, rh + gap, bar_w, bh)
 
-        # 기본 서식 적용 후 에디터 초기화
+        # 서식 적용 후 에디터 초기화
         self._edit.clear()
+        if initial_text:
+            self._edit.setPlainText(initial_text)
         self._apply_format()
 
         self.raise_()
@@ -331,6 +340,10 @@ class InlineTextEditor(QWidget):
         s = self._bar.get_settings()
         s["text"] = self._edit.toPlainText()
         return s
+
+    def commit(self):
+        """외부(canvas)에서 바깥 클릭 감지 후 확정 트리거."""
+        self._on_commit()
 
     # ------------------------------------------------------------------ #
     #  내부 슬롯

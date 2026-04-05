@@ -255,8 +255,8 @@ class MainWindow(QMainWindow):
 
         # 배경 제거
         tb.sig_remove_bg_auto.connect(self._on_remove_bg_auto)
-        tb.sig_apply_brush.connect(self._on_apply_brush)
-        tb.sig_clear_brush.connect(self._canvas_edit.clear_brush_overlay)
+        # 브러시 마스크: 마우스 릴리즈 시 자동 적용
+        self._canvas_edit.brush_stroke_done.connect(self._auto_apply_brush)
 
         # 크롭
         tb.sig_crop_size_preview.connect(self._on_crop_size_preview)
@@ -289,17 +289,18 @@ class MainWindow(QMainWindow):
         # 색상 도구
         self._canvas_edit.color_sampled.connect(self._on_color_sampled)
         self._canvas_edit.fill_applied.connect(self._on_fill_applied)
+        # 색상 브러시: 마우스 릴리즈 시 자동 적용
         self._canvas_edit.color_brush_done.connect(self._on_color_brush_done)
-        tb.sig_apply_color_brush.connect(self._on_apply_color_brush)
-        tb.sig_clear_color_brush.connect(self._on_clear_color_brush)
         tb.sig_color_changed.connect(self._on_tool_color_changed)
 
         # 도형 그리기 / AI 인페인팅
         self._canvas_edit.shape_committed.connect(self._on_shape_committed)
         self._canvas_edit.inpaint_committed.connect(self._on_inpaint_committed)
 
-        # 텍스트 삽입 (인라인 에디터가 canvas 내부에서 처리 후 text_committed 발생)
+        # 텍스트 삽입 (인라인 에디터가 canvas 내부에서 처리 후 시그널 발생)
         self._canvas_edit.text_committed.connect(self._on_text_committed)
+        self._canvas_edit.text_edit_committed.connect(self._on_text_edit_committed)
+        self._canvas_edit.text_overlay_resized.connect(self._on_text_overlay_resized)
 
         # 퀵 도구 패널
         qp = self._quick_panel
@@ -344,6 +345,7 @@ class MainWindow(QMainWindow):
             ("C",           lambda: self._set_tool_mode("crop")),
             ("P",           lambda: self._set_tool_mode("polygon")),
             ("T",           lambda: self._set_tool_mode("text")),
+            ("E",           lambda: self._set_tool_mode("select")),  # 선택/편집 모드
             ("Ctrl+R",      self._on_reset),
             # 줌
             ("Ctrl+=",      self._canvas_edit.zoom_in),
@@ -657,6 +659,7 @@ class MainWindow(QMainWindow):
             "shape_ellipse": "드래그로 점선 원/타원 영역을 지정하세요",
             "inpaint":       "드래그로 AI 채우기 영역을 선택하세요 — 드래그 완료 시 자동 적용",
             "text":          "드래그로 텍스트 박스 영역을 지정하세요",
+            "select":        "레이어 클릭으로 편집 — 텍스트 클릭 시 수정, 이미지 클릭 시 선택",
         }
         self._status.set_message(mode_labels.get(mode, ""))
 
@@ -824,7 +827,6 @@ class MainWindow(QMainWindow):
                 self._canvas_edit.set_image(img)
                 self._status.set_message(f"GrabCut 완료: ({x},{y}) {w}×{h}")
                 self._update_edit_state()
-            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
             self._status.set_message("GrabCut 실패")
@@ -850,14 +852,12 @@ class MainWindow(QMainWindow):
                 self._canvas_edit.set_image(img)
                 self._status.set_message(f"다각형 선택 완료: 꼭짓점 {len(points)}개")
                 self._update_edit_state()
-            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
-    def _on_apply_brush(self):
-        mask = self._canvas_edit._brush_mask
+    def _auto_apply_brush(self, mask):
+        """브러시 스트로크 완료 시 마스크 자동 적용."""
         if mask is None or not (mask == 255).any():
-            QMessageBox.warning(self, "경고", "먼저 지울 영역을 브러시로 칠하세요.")
             return
         idx = self._get_active_overlay_idx()
         try:
@@ -873,8 +873,8 @@ class MainWindow(QMainWindow):
                 self._canvas_edit.set_image(img)
                 self._status.set_message("브러시 마스크 적용 완료")
                 self._update_edit_state()
-            else:
-                QMessageBox.warning(self, "경고", "편집할 레이어를 선택하세요.")
+            # 적용 후 마스크 초기화 (다음 스트로크 준비)
+            self._canvas_edit.clear_brush_overlay()
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -915,14 +915,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "오류", str(e))
 
     def _on_color_brush_done(self, mask):
-        """색상 브러시 획 완료: 마스크 저장"""
-        self._color_brush_pending_mask = mask
-
-    def _on_apply_color_brush(self):
-        """색상 브러시 적용 버튼"""
-        mask = self._color_brush_pending_mask
+        """색상 브러시 스트로크 완료: 즉시 자동 적용."""
         if mask is None or not (mask == 255).any():
-            QMessageBox.warning(self, "경고", "먼저 색상 브러시로 칠할 영역을 선택하세요.")
             return
         idx = self._get_active_overlay_idx()
         try:
@@ -933,26 +927,15 @@ class MainWindow(QMainWindow):
                     local_mask = self._translate_brush_mask_to_overlay(mask, ov)
                     color = self._current_tool_color
                     if self._apply_to_overlay(idx, lambda p: p.apply_color_brush(local_mask, color)):
-                        self._color_brush_pending_mask = None
                         self._status.set_message("레이어 색상 브러시 적용 완료")
             elif self._processor.has_image:
                 img = self._processor.apply_color_brush(mask, self._current_tool_color)
                 self._canvas_edit.set_image(img)
-                self._color_brush_pending_mask = None
                 self._status.set_message("색상 브러시 적용 완료")
                 self._update_edit_state()
-            else:
-                QMessageBox.warning(self, "경고", "편집할 레이어를 선택하세요.")
+            self._color_brush_pending_mask = None
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
-
-    def _on_clear_color_brush(self):
-        """색상 브러시 초기화"""
-        self._color_brush_pending_mask = None
-        self._canvas_edit._color_brush_mask = None
-        self._canvas_edit._color_brush_overlay = None
-        self._canvas_edit.update()
-        self._set_tool_mode("none")
 
     # ------------------------------------------------------------------ #
     #  도형 그리기 / AI 인페인팅
@@ -985,7 +968,6 @@ class MainWindow(QMainWindow):
                     f"({x},{y}) {w}×{h}  #{r:02x}{g:02x}{b:02x}"
                 )
                 self._update_edit_state()
-            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -1008,7 +990,6 @@ class MainWindow(QMainWindow):
                 self._canvas_edit.set_image(img)
                 self._status.set_message(f"빈 영역 채우기 완료: ({x},{y}) {w}×{h}")
                 self._update_edit_state()
-            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -1017,9 +998,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _on_text_committed(self, settings: dict, ix: int, iy: int, iw: int, ih: int):
         """인라인 에디터 삽입 확정 → PIL 렌더링 후 오버레이로 추가"""
-        # 인라인 에디터가 canvas.set_mode(none)을 이미 호출했으므로 툴바만 동기화
-        self._toolbar.set_mode("none")
-        self._quick_panel.set_mode("none")
+        # 텍스트 모드 유지 — 완료 후 바로 다음 텍스트 박스 드래그 가능
         self._last_text_settings = settings
 
         text = settings["text"].strip()
@@ -1038,7 +1017,73 @@ class MainWindow(QMainWindow):
         if overlays:
             idx = len(overlays) - 1
             self._canvas_edit.move_overlay(idx, ox, oy)
+            # 텍스트 서식 저장 (재편집·리사이즈 재렌더링용)
+            saved = dict(settings)
+            saved['box_w'] = iw
+            overlays[idx]['text_settings'] = saved
         self._status.set_message("텍스트 삽입 완료")
+
+    def _on_text_edit_committed(self, settings: dict, overlay_idx: int,
+                                 ix: int, iy: int, iw: int, ih: int):
+        """기존 텍스트 오버레이 수정 확정 → 재렌더링 후 인-플레이스 교체"""
+        self._last_text_settings = settings
+
+        text = settings["text"].strip()
+        if not text:
+            self._status.set_message("텍스트가 비어 있습니다")
+            return
+
+        text_img = self._render_text_to_pil(settings, box_w=iw)
+        if text_img is None:
+            return
+
+        # 오버레이 이미지 교체 (update_overlay_image는 disp_w/h를 pil 크기로 초기화)
+        self._canvas_edit.update_overlay_image(overlay_idx, text_img)
+
+        # disp_w를 원래 박스 너비로 복원, disp_h는 텍스트 내용 높이로 설정
+        overlays = self._canvas_edit.get_overlays()
+        if 0 <= overlay_idx < len(overlays):
+            ov = overlays[overlay_idx]
+            ov['disp_w'] = iw
+            ov['disp_h'] = text_img.height
+            saved = dict(settings)
+            saved['box_w'] = iw
+            ov['text_settings'] = saved
+            ov['name'] = f"텍스트: {text[:12]}"
+        self._status.set_message("텍스트 수정 완료")
+
+    def _on_text_overlay_resized(self, overlay_idx: int, new_disp_w: int):
+        """텍스트 오버레이 너비 변경 후 텍스트 재렌더링 (PPT 방식 — 너비 조절 시 자동 리플로우)"""
+        from PyQt6.QtGui import QImage as _QI, QPixmap as _QP
+
+        overlays = self._canvas_edit.get_overlays()
+        if overlay_idx < 0 or overlay_idx >= len(overlays):
+            return
+        ov = overlays[overlay_idx]
+        settings = ov.get('text_settings')
+        if not settings:
+            return
+
+        box_w = max(20, new_disp_w)
+        text_img = self._render_text_to_pil(settings, box_w=box_w)
+        if text_img is None:
+            return
+
+        pil = text_img.convert("RGBA")
+        data = pil.tobytes("raw", "RGBA")
+        qimg = _QI(data, pil.width, pil.height, _QI.Format.Format_RGBA8888)
+
+        # pil/pixmap 직접 교체 (disp_w는 사용자 지정 값 유지, disp_h는 내용 높이)
+        ov['pil']    = pil
+        ov['pixmap'] = _QP.fromImage(qimg)
+        ov['disp_w'] = new_disp_w
+        ov['disp_h'] = pil.height
+        saved = dict(settings)
+        saved['box_w'] = new_disp_w
+        ov['text_settings'] = saved
+
+        self._canvas_edit.update()
+        self._status.set_message("텍스트 너비 재렌더링 완료")
 
     def _render_text_to_pil(self, settings: dict, box_w: int | None = None):
         """텍스트 서식 설정을 PIL RGBA 이미지로 렌더링. box_w 지정 시 줄 바꿈 적용."""
@@ -1213,7 +1258,6 @@ class MainWindow(QMainWindow):
                 self._workspace_size_lbl.setText(f"작업 크기: {nw} × {nh} px")
                 self._status.set_message(f"크롭 완료: {nw}×{nh}")
                 self._update_edit_state()
-            self._set_tool_mode("none")
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 

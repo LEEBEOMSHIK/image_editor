@@ -2,6 +2,9 @@
 
 이 파일은 Claude Code가 이 프로젝트를 이해하고 작업할 때 참조하는 지침입니다.
 
+> **함수·시그널 상세 명세**: [`claude-config/function-spec.md`](claude-config/function-spec.md) 를 참조하세요.
+> 각 모듈의 공개 메서드, 시그널 목록, 오버레이 딕셔너리 구조 등이 정리되어 있습니다.
+
 ---
 
 ## 프로젝트 개요

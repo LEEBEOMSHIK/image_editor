@@ -78,8 +78,6 @@ class Toolbar(QWidget):
 
     sig_mode_changed   = pyqtSignal(str)
     sig_remove_bg_auto = pyqtSignal()
-    sig_apply_brush    = pyqtSignal()
-    sig_clear_brush    = pyqtSignal()
     sig_crop_size_preview = pyqtSignal(int, int)   # 크기 지정 크롭 미리보기 모드
 
     sig_filter  = pyqtSignal(str)
@@ -93,8 +91,6 @@ class Toolbar(QWidget):
     sig_zoom_out = pyqtSignal()
 
     sig_color_changed      = pyqtSignal(int, int, int, int)  # r, g, b, a (색상 변경)
-    sig_apply_color_brush  = pyqtSignal()
-    sig_clear_color_brush  = pyqtSignal()
 
     sig_text_mode = pyqtSignal()   # 텍스트 삽입 모드 진입
 
@@ -191,7 +187,7 @@ class Toolbar(QWidget):
         self.btn_brush = ToolButton("🖌 브러시 마스크")
         self.btn_brush.setToolTip(
             "브러시 모드  (단축키: B)\n"
-            "지울 영역을 붓으로 칠한 뒤 '브러시 적용' 클릭"
+            "지울 영역을 붓으로 칠하면 마우스를 떼는 순간 자동 적용됩니다."
         )
         self.btn_brush.clicked.connect(self._on_brush_toggle)
         layout.addWidget(self.btn_brush)
@@ -204,17 +200,6 @@ class Toolbar(QWidget):
         self.brush_slider.setStyleSheet("QSlider::handle:horizontal { background:#89b4fa; }")
         brush_row.addWidget(self.brush_slider)
         layout.addLayout(brush_row)
-
-        btn_row2 = QHBoxLayout()
-        btn_apply_brush = ActionButton("브러시 적용")
-        btn_apply_brush.setToolTip("칠한 영역을 투명 처리")
-        btn_apply_brush.clicked.connect(self.sig_apply_brush)
-        btn_clear_brush = ActionButton("초기화", "#fab387")
-        btn_clear_brush.setToolTip("브러시 영역 초기화")
-        btn_clear_brush.clicked.connect(self._on_clear_brush)
-        btn_row2.addWidget(btn_apply_brush)
-        btn_row2.addWidget(btn_clear_brush)
-        layout.addLayout(btn_row2)
 
         layout.addWidget(self._separator())
 
@@ -246,21 +231,10 @@ class Toolbar(QWidget):
         self.btn_color_brush = ToolButton("🖌 색상 브러시")
         self.btn_color_brush.setToolTip(
             "색상 브러시 모드\n마우스로 칠한 영역에 현재 색상을 적용합니다.\n"
-            "칠한 후 '색상 브러시 적용' 클릭"
+            "마우스를 떼는 순간 자동 적용됩니다."
         )
         self.btn_color_brush.clicked.connect(self._on_color_brush_toggle)
         layout.addWidget(self.btn_color_brush)
-
-        color_btn_row = QHBoxLayout()
-        btn_apply_color_brush = ActionButton("브러시 적용")
-        btn_apply_color_brush.setToolTip("색상 브러시로 칠한 영역에 색상 적용")
-        btn_apply_color_brush.clicked.connect(self.sig_apply_color_brush)
-        btn_clear_color_brush = ActionButton("초기화", "#fab387")
-        btn_clear_color_brush.setToolTip("색상 브러시 영역 초기화")
-        btn_clear_color_brush.clicked.connect(self._on_clear_color_brush)
-        color_btn_row.addWidget(btn_apply_color_brush)
-        color_btn_row.addWidget(btn_clear_color_brush)
-        layout.addLayout(color_btn_row)
 
         layout.addWidget(self._separator())
 
@@ -312,7 +286,11 @@ class Toolbar(QWidget):
         self.btn_text = ToolButton("T 텍스트 삽입")
         self.btn_text.setToolTip(
             "텍스트 모드  (단축키: T)\n"
-            "캔버스를 클릭하면 텍스트 서식 다이얼로그가 열립니다."
+            "드래그로 텍스트 박스를 만들면 즉시 편집 모드로 진입합니다.\n"
+            "• 상단 파란 스트립: 드래그하여 박스 이동\n"
+            "• 4 모서리 파란 핸들: 드래그하여 크기 조절\n"
+            "• 텍스트 박스 바깥 클릭 / '완료' / Ctrl+Enter: 레이어로 확정\n"
+            "• Esc: 취소"
         )
         self.btn_text.clicked.connect(self._on_text_toggle)
         layout.addWidget(self.btn_text)
@@ -477,11 +455,6 @@ class Toolbar(QWidget):
         self.btn_polygon.setChecked(True)
         self.sig_mode_changed.emit("polygon")
 
-    def _on_clear_brush(self):
-        self._clear_mode_buttons()
-        self.sig_mode_changed.emit("none")
-        self.sig_clear_brush.emit()
-
     def _on_pipette_toggle(self):
         self._clear_mode_buttons()
         self.btn_pipette.setChecked(True)
@@ -496,11 +469,6 @@ class Toolbar(QWidget):
         self._clear_mode_buttons()
         self.btn_color_brush.setChecked(True)
         self.sig_mode_changed.emit("color_brush")
-
-    def _on_clear_color_brush(self):
-        self._clear_mode_buttons()
-        self.sig_mode_changed.emit("none")
-        self.sig_clear_color_brush.emit()
 
     def _on_shape_rect_toggle(self):
         self._clear_mode_buttons()
